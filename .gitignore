@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+native/build/
+cpu_ext/build/
+*.so
+.DS_Store
+# optional private files the code looks for; never commit them
+remote_presets.py
+local_defaults.py
+presets.sh
+moe_local.sh
+stage.py
+lifelong_probe.py

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-theme-setting="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Settings - Local chat</title>
+<meta name="theme-color" content="#ffffff">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="alternate icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/pages.css">
+</head>
+<body class="page">
+<a class="skip-link" href="#settings">Skip to the settings</a>
+<header class="page-top">
+  <a class="back-link" href="/" id="backLink" aria-label="Back to chat">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+    <span>Chat</span>
+  </a>
+  <nav class="page-tabs" aria-label="Pages">
+    <a href="/settings" aria-current="page">Settings</a>
+    <a href="/monitor">Status</a>
+  </nav>
+  <div class="top-actions">
+    <div class="theme-wrap">
+      <button class="icon-btn" id="themeBtn" type="button" aria-label="Theme" aria-haspopup="menu" aria-expanded="false" title="Theme">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></svg>
+      </button>
+      <div class="menu" id="themeMenu" role="menu" aria-label="Theme" hidden>
+        <button type="button" role="menuitemradio" data-theme-choice="system" aria-checked="false"><span>System</span><span class="check" aria-hidden="true">&#10003;</span></button>
+        <button type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false"><span>Light</span><span class="check" aria-hidden="true">&#10003;</span></button>
+        <button type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false"><span>Dark</span><span class="check" aria-hidden="true">&#10003;</span></button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="page-body">
+  <nav class="side-nav" id="sideNav" aria-label="Settings sections">
+    <a href="#sec-model">Model</a>
+    <a href="#sec-memory">Memory</a>
+    <a href="#sec-replies">Replies</a>
+    <a href="#sec-chats">Chats and data</a>
+    <a href="#sec-machine">About this machine</a>
+  </nav>
+
+  <main class="sections" id="settings">
+    <h1 class="page-title">Settings</h1>
+
+    <section class="panel" id="sec-model" aria-labelledby="h-model">
+      <h2 id="h-model">Model</h2>
+      <p class="panel-lead">The model this server is running, and the models the launcher has tested for this computer.</p>
+      <div class="card set-now">
+        <h3>Running now</h3>
+        <dl id="setCurrent" class="stats"></dl>
+        <p class="set-hint" id="planNote" hidden></p>
+      </div>
+      <div class="card">
+        <h3>Models</h3>
+        <p class="set-hint">The launcher's tested models for this computer. Use starts one with the launcher's own flags for that model; the options below apply when you press Apply. A download or a 3-bit copy is the same step the terminal menu runs, so a stopped one resumes where it stopped. Search looks on Hugging Face, or reads one repo from an owner/name or a link, and judges the results for this computer.</p>
+        <form class="model-tools" id="modelSearchForm" role="search">
+          <input id="modelSearch" type="search" placeholder="Search Hugging Face, or paste owner/name or a link" aria-label="Search Hugging Face, or paste an owner/name or a link" autocomplete="off" spellcheck="false">
+          <button class="mini-btn" id="modelSearchBtn" type="submit">Search</button>
+          <button class="mini-btn" id="modelRefresh" type="button" title="Look at this computer's disks and the list again">Refresh the list</button>
+        </form>
+        <p class="set-hint" id="searchNote" role="status" aria-live="polite"></p>
+        <div class="found" id="foundBox" hidden>
+          <div class="found-head">
+            <h4 id="foundTitle"></h4>
+            <button class="mini-btn" id="foundClear" type="button">Clear</button>
+          </div>
+          <div class="model-list" id="foundList"></div>
+          <p class="set-hint" id="foundNote"></p>
+        </div>
+        <div class="model-list" id="modelList"></div>
+        <p class="set-hint" id="setListNote" hidden></p>
+      </div>
+    </section>
+
+    <section class="panel" id="sec-memory" aria-labelledby="h-memory">
+      <h2 id="h-memory">Memory</h2>
+      <p class="panel-lead">How much memory the engine may keep.</p>
+      <div class="card">
+        <h3>In use now</h3>
+        <dl class="stats" id="memNow"></dl>
+        <div class="gauge" id="memGauge" role="meter" aria-label="Memory in use" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="gauge-fill" id="memGaugeFill"></span></div>
+      </div>
+      <div class="card">
+        <div class="opt">
+          <label class="opt-label" for="memLimit">Memory limit</label>
+          <div class="opt-row">
+            <select id="memLimit">
+              <option value="auto">Auto</option>
+              <option value="fixed">A fixed limit</option>
+            </select>
+            <input id="memGb" class="num" type="number" min="1" max="64" step="0.5" inputmode="decimal" aria-label="Memory limit in GB" hidden>
+            <span class="unit" id="memUnit" hidden>GB</span>
+          </div>
+          <p class="opt-note" id="memNote">Auto uses the launcher's choice for this computer and this model right now.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="sec-replies" aria-labelledby="h-replies">
+      <h2 id="h-replies">Replies</h2>
+      <p class="panel-lead">How the engine answers.</p>
+      <div class="card">
+        <div class="opt">
+          <label class="switch">
+            <input id="optFast" type="checkbox" role="switch">
+            <span class="track" aria-hidden="true"><span class="knob"></span></span>
+            <span class="switch-text">Faster replies</span>
+          </label>
+          <p class="opt-note">The router prefers experts already in memory, so replies can differ slightly. On a model that passed the quality check this is how the launcher runs it; on another model it is your choice.</p>
+        </div>
+        <div class="opt">
+          <label class="switch">
+            <input id="optThink" type="checkbox" role="switch">
+            <span class="track" aria-hidden="true"><span class="knob"></span></span>
+            <span class="switch-text">Thinking on by default</span>
+          </label>
+          <p class="opt-note">For apps that talk to this server without choosing, such as editor extensions. The Thinking switch under the message box still decides for the chat page.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="sec-chats" aria-labelledby="h-chats">
+      <h2 id="h-chats">Chats and data</h2>
+      <p class="panel-lead">Where your chats live, and how to move them.</p>
+      <div class="card">
+        <h3>Where things are stored</h3>
+        <dl class="where" id="whereList"></dl>
+      </div>
+      <div class="card">
+        <h3>Your chats in this browser</h3>
+        <p class="set-hint nomargin" id="chatSummary"></p>
+        <p class="set-hint">The launcher always opens this chat at the same address, so your saved chats stay when you switch models or computers.</p>
+        <ul class="chat-groups" id="chatGroups"></ul>
+        <div class="btn-row">
+          <button class="mini-btn primary" id="exportBtn" type="button">Export all chats</button>
+          <button class="mini-btn" id="importBtn" type="button">Import chats</button>
+          <input id="importFile" type="file" accept=".json,application/json" hidden>
+        </div>
+        <p class="set-hint" id="chatNote" role="status" aria-live="polite"></p>
+        <p class="set-hint">Export writes one JSON file with every chat, its model and its computer. Import reads such a file and adds the chats this browser does not have; a chat that is already here is replaced only by a newer copy. Pictures are never saved, only how many there were.</p>
+      </div>
+    </section>
+
+    <section class="panel" id="sec-machine" aria-labelledby="h-machine">
+      <h2 id="h-machine">About this machine</h2>
+      <p class="panel-lead">What the launcher sees on the computer that runs the model.</p>
+      <div class="card">
+        <p class="set-hint nomargin" id="setMachine"></p>
+        <dl class="stats" id="aboutList"></dl>
+      </div>
+    </section>
+    <div class="apply-bar">
+      <button class="primary-btn" id="applyBtn" type="button">Apply</button>
+      <span id="applyNote" role="status" aria-live="polite"></span>
+    </div>
+  </main>
+</div>
+
+<script src="/common.js"></script>
+<script src="/settings.js"></script>
+</body>
+</html>

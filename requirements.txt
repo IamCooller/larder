@@ -1,0 +1,15 @@
+# python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Apple Silicon: MLX's Metal build. The native reader (native/build.sh) is built for 0.32.2.
+mlx==0.32.2; sys_platform == "darwin"
+# Linux + NVIDIA: MLX's CUDA build.
+mlx[cuda13]==0.32.4; sys_platform == "linux"
+# mlx-lm with Qwen3.8-Flash-Next (qwen4_exp; ml-explore/mlx-lm pull request 1788, not in a release yet).
+mlx-lm @ https://github.com/IamCooller/mlx-lm/archive/21968365476c7b6add62c2259e0cc4f86ef70704.zip
+# The rest at the versions a clean install resolved on 2026-11-07 (macOS, Apple M4), pinned so installs repeat.
+huggingface_hub==2.4.0
+transformers==5.22.2
+tokenizers==0.23.3
+safetensors==0.8.0
+numpy==2.5.4
+# Images (vision.py): decoding and resizing; without it a model takes no images.
+Pillow==13.0.0

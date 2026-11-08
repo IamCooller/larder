@@ -1,0 +1,17 @@
+#!/bin/sh
+# One command for the whole thing: ./larder (README, "Run it").
+set -eu
+cd "$(dirname "$0")"
+PY=python3
+if [ -x .venv/bin/python ]; then PY=.venv/bin/python; fi
+if [ $# -gt 0 ]; then
+    # A checkout can add subcommands in moe_local.sh, which sees the same arguments and execs or returns.
+    if [ -f ./moe_local.sh ]; then . ./moe_local.sh; fi
+    case "$1" in
+        stop|status) exec "$PY" launch.py "--$1" ;;
+        tune) shift; exec "$PY" tuner.py "$@" ;;
+        refresh) shift; exec "$PY" pack_refresh.py "$@" ;;
+        share) shift; exec "$PY" share.py "$@" ;;
+    esac
+fi
+exec "$PY" launch.py "$@"

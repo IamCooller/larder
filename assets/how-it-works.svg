@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500" role="img" aria-labelledby="t d">
+  <title id="t">How one token goes through a layer</title>
+  <desc id="d">The router picks a few experts. Experts in the memory cache are reused, a missing expert is read from the SSD as one record, the GPU computes, and the next layer's experts are guessed and read ahead while this layer computes.</desc>
+  <style>
+    text { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 15px; }
+    .small { font-size: 13px; }
+    .title { font-size: 16px; font-weight: 600; }
+    .box { stroke-width: 1.5; }
+    .mem, .ssd, .gpu { stroke-width: 2; }
+    .arrow { fill: none; stroke-width: 2; marker-end: url(#a); }
+    .ahead { fill: none; stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#b); }
+    .mid { text-anchor: middle; }
+    text { fill: #0b0b0b; }
+    .small { fill: #52514e; }
+    .box { fill: #f3f2ee; stroke: #c9c8c2; }
+    .mem { fill: #e3eefb; stroke: #2a78d6; }
+    .ssd { fill: #fcebe3; stroke: #eb6834; }
+    .gpu { fill: #e0f5ed; stroke: #1baf7a; }
+    .arrow { stroke: #8a8984; }
+    .ahead { stroke: #eb6834; }
+    .chip { fill: #2a78d6; }
+    .rec { fill: #eb6834; }
+    .warm, text.small.warm { fill: #eb6834; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #f0efec; }
+      .small { fill: #c3c2b7; }
+      .box { fill: #1f1f1e; stroke: #3f3f3c; }
+      .mem { fill: #16263a; stroke: #3987e5; }
+      .ssd { fill: #33201a; stroke: #d95926; }
+      .gpu { fill: #14302a; stroke: #199e70; }
+      .arrow { stroke: #8a8984; }
+      .ahead { stroke: #d95926; }
+      .chip { fill: #3987e5; }
+      .rec { fill: #d95926; }
+      .warm, text.small.warm { fill: #d95926; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#8a8984"/></marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#eb6834"/></marker>
+  </defs>
+
+  <!-- token and layer -->
+  <rect class="box" x="20" y="34" width="90" height="52" rx="10"/>
+  <text class="mid" x="65" y="65">a token</text>
+  <path class="arrow" d="M110 60H150"/>
+  <rect class="box" x="150" y="20" width="630" height="80" rx="12"/>
+  <text class="title" x="168" y="46">One layer (40 or 48 of them)</text>
+  <rect class="box" x="168" y="56" width="200" height="34" rx="8"/>
+  <text x="180" y="78">Router: picks a few experts</text>
+  <text class="small" x="390" y="78">8 of 256 in the 35B, 10 of 512 in Flash-Next</text>
+
+  <!-- split -->
+  <path class="arrow" d="M200 100V190"/>
+  <path class="arrow" d="M300 100V140H610V190"/>
+  <text class="small" x="210" y="150">in memory</text>
+  <text class="small" x="420" y="132">not in memory</text>
+
+  <!-- cache -->
+  <rect class="mem" x="20" y="190" width="330" height="130" rx="12"/>
+  <text class="title" x="38" y="216">Memory: the expert cache</text>
+  <g class="chip">
+    <rect x="38" y="232" width="34" height="22" rx="4"/><rect x="80" y="232" width="34" height="22" rx="4"/>
+    <rect x="122" y="232" width="34" height="22" rx="4"/><rect x="164" y="232" width="34" height="22" rx="4"/>
+    <rect x="206" y="232" width="34" height="22" rx="4"/><rect x="248" y="232" width="34" height="22" rx="4"/>
+  </g>
+  <text class="small" x="38" y="282">Experts used recently stay here and are reused.</text>
+  <text class="small" x="38" y="302">Attention and routers are always here.</text>
+
+  <!-- ssd -->
+  <rect class="ssd" x="440" y="190" width="340" height="130" rx="12"/>
+  <text class="title" x="458" y="216">SSD: one record per expert</text>
+  <g class="rec">
+    <rect x="458" y="232" width="34" height="22" rx="4"/><rect x="500" y="232" width="34" height="22" rx="4"/>
+    <rect x="542" y="232" width="34" height="22" rx="4"/><rect x="584" y="232" width="34" height="22" rx="4"/>
+    <rect x="626" y="232" width="34" height="22" rx="4"/><rect x="668" y="232" width="34" height="22" rx="4"/>
+    <rect x="710" y="232" width="34" height="22" rx="4"/>
+  </g>
+  <text class="small" x="458" y="282">A missing expert is read as one record,</text>
+  <text class="small" x="458" y="302">45.8 to 75.5 GB of them in Flash-Next.</text>
+
+  <!-- read ahead -->
+  <path class="ahead" d="M440 262H356"/>
+  <text class="small mid warm" x="398" y="350">read ahead: the next layer's</text>
+  <text class="small mid warm" x="398" y="367">experts are guessed and loaded</text>
+  <text class="small mid warm" x="398" y="384">while this layer computes</text>
+
+  <!-- to gpu -->
+  <path class="arrow" d="M185 320V410"/>
+  <path class="arrow" d="M610 320V410"/>
+  <text class="small" x="195" y="372">reuse</text>
+  <text class="small" x="620" y="372">read</text>
+
+  <rect class="gpu" x="20" y="410" width="760" height="56" rx="12"/>
+  <text class="title" x="40" y="444">GPU: multiply and add for the chosen experts, then the next layer</text>
+  <text class="small" x="40" y="486">After the last layer comes the next token, and it takes the same path.</text>
+</svg>

@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 682" width="960" height="682" font-family="SF Mono, Menlo, Consolas, DejaVu Sans Mono, monospace" font-size="14">
+<title>The ./larder menu: models, size on disk and expected speed on this computer</title>
+<rect width="960" height="682" rx="10" fill="#fbfbfc" stroke="#d3d6dc"/>
+<path d="M0 10a10 10 0 0 1 10-10h940a10 10 0 0 1 10 10v24H0z" fill="#e9ebef"/>
+<circle cx="18" cy="17.0" r="6" fill="#ff5f57"/>
+<circle cx="38" cy="17.0" r="6" fill="#febc2e"/>
+<circle cx="58" cy="17.0" r="6" fill="#28c840"/>
+<text x="480" y="22.0" text-anchor="middle" fill="#2b2f36" opacity=".7">./larder</text>
+<rect x="18.0" y="52.0" width="924.0" height="18.0" fill="#9fdcee"/>
+<text xml:space="preserve" x="18.0" y="65.0" textLength="924.0" lengthAdjust="spacing" fill="#06222b" font-weight="700">  larder   devices / this computer                                                                            </text>
+<text xml:space="preserve" x="18.0" y="83.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36"> this computer   Apple M4, 16 GB memory   engine at ~/larder                                                  </text>
+<text xml:space="preserve" x="18.0" y="101.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36"> its own list, as that computer computes it; r asks again                                                     </text>
+<text xml:space="preserve" x="18.0" y="119.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36">--------------------------------------------------------------------------------------------------------------</text>
+<text xml:space="preserve" x="18.0" y="137.0" textLength="520.8" lengthAdjust="spacing" fill="#111318" font-weight="700">   1  Qwen3.6-35B-A3B  (tested)   MoE, 256 experts x 40 layers</text>
+<text xml:space="preserve" x="18.0" y="155.0" textLength="722.4" lengthAdjust="spacing" fill="#111318" font-weight="700">   2  Qwen3.8-Flash-Next (3-bit EXL3 experts)  (tested)   MoE, 512 experts x 48 layers</text>
+<text xml:space="preserve" x="18.0" y="173.0" textLength="571.2" lengthAdjust="spacing" fill="#111318" font-weight="700">   3  Qwen1.5-MoE-A2.7B-Chat  (tested)   MoE, 60 experts x 24 layers</text>
+<text xml:space="preserve" x="18.0" y="191.0" textLength="268.8" lengthAdjust="spacing" fill="#111318" font-weight="700">   4  Qwen3-8B  (tested)   dense</text>
+<text xml:space="preserve" x="18.0" y="209.0" textLength="268.8" lengthAdjust="spacing" fill="#111318" font-weight="700"> &gt; 5  Qwen3-4B  (tested)   dense</text>
+<rect x="18.0" y="214.0" width="924.0" height="18.0" fill="#1f6f9f"/>
+<text xml:space="preserve" x="18.0" y="227.0" textLength="924.0" lengthAdjust="spacing" fill="#ffffff" font-weight="700">      a  as published, 4-bit         2.3 GB  ~44 tok/s (estimate)       ######.. download 2.3 GB  &lt;- start... </text>
+<text xml:space="preserve" x="18.0" y="245.0" textLength="604.8" lengthAdjust="spacing" fill="#2b2f36">      b  16-bit                      8.1 GB  --                         </text>
+<text xml:space="preserve" x="622.8" y="245.0" textLength="310.8" lengthAdjust="spacing" fill="#b3261e">can't run: the whole model stays i...</text>
+<text xml:space="preserve" x="18.0" y="263.0" textLength="604.8" lengthAdjust="spacing" fill="#2b2f36">      c  8-bit                       4.3 GB  ~23 tok/s (estimate)       </text>
+<text xml:space="preserve" x="622.8" y="263.0" textLength="25.2" lengthAdjust="spacing" fill="#ff0000" font-weight="700">###</text>
+<text xml:space="preserve" x="648.0" y="263.0" textLength="50.4" lengthAdjust="spacing" fill="#2b2f36">..... </text>
+<text xml:space="preserve" x="698.4" y="263.0" textLength="126.0" lengthAdjust="spacing" fill="#00afff" font-weight="700">download 4.3 GB</text>
+<text xml:space="preserve" x="18.0" y="281.0" textLength="604.8" lengthAdjust="spacing" fill="#2b2f36">      d  6-bit                       3.3 GB  ~30 tok/s (estimate)       </text>
+<text xml:space="preserve" x="622.8" y="281.0" textLength="25.2" lengthAdjust="spacing" fill="#ff0000" font-weight="700">###</text>
+<text xml:space="preserve" x="648.0" y="281.0" textLength="8.4" lengthAdjust="spacing" fill="#a35f00" font-weight="700">#</text>
+<text xml:space="preserve" x="656.4" y="281.0" textLength="42.0" lengthAdjust="spacing" fill="#2b2f36">.... </text>
+<text xml:space="preserve" x="698.4" y="281.0" textLength="126.0" lengthAdjust="spacing" fill="#00afff" font-weight="700">download 3.3 GB</text>
+<text xml:space="preserve" x="18.0" y="299.0" textLength="604.8" lengthAdjust="spacing" fill="#2b2f36">      e  3-bit                       1.8 GB  ~56 tok/s (estimate)       </text>
+<text xml:space="preserve" x="622.8" y="299.0" textLength="25.2" lengthAdjust="spacing" fill="#ff0000" font-weight="700">###</text>
+<text xml:space="preserve" x="648.0" y="299.0" textLength="16.8" lengthAdjust="spacing" fill="#a35f00" font-weight="700">##</text>
+<text xml:space="preserve" x="664.8" y="299.0" textLength="25.2" lengthAdjust="spacing" fill="#14783c" font-weight="700">###</text>
+<text xml:space="preserve" x="698.4" y="299.0" textLength="126.0" lengthAdjust="spacing" fill="#00afff" font-weight="700">download 1.8 GB</text>
+<text xml:space="preserve" x="18.0" y="317.0" textLength="604.8" lengthAdjust="spacing" fill="#2b2f36">      f  3-bit, made here            1.8 GB  ~56 tok/s (estimate)       </text>
+<text xml:space="preserve" x="622.8" y="317.0" textLength="25.2" lengthAdjust="spacing" fill="#ff0000" font-weight="700">###</text>
+<text xml:space="preserve" x="648.0" y="317.0" textLength="16.8" lengthAdjust="spacing" fill="#a35f00" font-weight="700">##</text>
+<text xml:space="preserve" x="664.8" y="317.0" textLength="25.2" lengthAdjust="spacing" fill="#14783c" font-weight="700">###</text>
+<text xml:space="preserve" x="698.4" y="317.0" textLength="235.2" lengthAdjust="spacing" fill="#a35f00" font-weight="700">~5 s to make after a 2.3 ...</text>
+<text xml:space="preserve" x="18.0" y="515.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36">--------------------------------------------------------------------------------------------------------------</text>
+<text xml:space="preserve" x="34.8" y="533.0" textLength="394.8" lengthAdjust="spacing" fill="#111318" font-weight="700">Qwen3-4B | as published, 4-bit | 2.3 GB on disk</text>
+<text xml:space="preserve" x="34.8" y="551.0" textLength="361.2" lengthAdjust="spacing" fill="#a35f00" font-weight="700">other apps use the GPU (93%): expect slower</text>
+<text xml:space="preserve" x="18.0" y="569.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36">  ~44 tok/s (estimate for this machine)                                                                       </text>
+<text xml:space="preserve" x="34.8" y="587.0" textLength="126.0" lengthAdjust="spacing" fill="#00afff" font-weight="700">download 2.3 GB</text>
+<text xml:space="preserve" x="18.0" y="605.0" textLength="924.0" lengthAdjust="spacing" fill="#2b2f36">  the model as published                                                                                      </text>
+<text xml:space="preserve" x="34.8" y="623.0" textLength="436.8" lengthAdjust="spacing" fill="#14783c" font-weight="700">Enter installs it and starts it (you confirm first).</text>
+<text xml:space="preserve" x="26.4" y="659.0" textLength="58.8" lengthAdjust="spacing" fill="#006c8c" font-weight="700">Up/Down</text>
+<text xml:space="preserve" x="85.2" y="659.0" textLength="67.2" lengthAdjust="spacing" fill="#2b2f36"> move   </text>
+<text xml:space="preserve" x="152.4" y="659.0" textLength="42.0" lengthAdjust="spacing" fill="#006c8c" font-weight="700">Enter</text>
+<text xml:space="preserve" x="194.4" y="659.0" textLength="84.0" lengthAdjust="spacing" fill="#2b2f36"> choose   </text>
+<text xml:space="preserve" x="278.4" y="659.0" textLength="8.4" lengthAdjust="spacing" fill="#006c8c" font-weight="700">r</text>
+<text xml:space="preserve" x="286.8" y="659.0" textLength="92.4" lengthAdjust="spacing" fill="#2b2f36"> refresh   </text>
+<text xml:space="preserve" x="379.2" y="659.0" textLength="8.4" lengthAdjust="spacing" fill="#006c8c" font-weight="700">/</text>
+<text xml:space="preserve" x="387.6" y="659.0" textLength="84.0" lengthAdjust="spacing" fill="#2b2f36"> search   </text>
+<text xml:space="preserve" x="471.6" y="659.0" textLength="8.4" lengthAdjust="spacing" fill="#006c8c" font-weight="700">d</text>
+<text xml:space="preserve" x="480.0" y="659.0" textLength="84.0" lengthAdjust="spacing" fill="#2b2f36"> delete   </text>
+<text xml:space="preserve" x="564.0" y="659.0" textLength="8.4" lengthAdjust="spacing" fill="#006c8c" font-weight="700">f</text>
+<text xml:space="preserve" x="572.4" y="659.0" textLength="84.0" lengthAdjust="spacing" fill="#2b2f36"> folder   </text>
+<text xml:space="preserve" x="656.4" y="659.0" textLength="25.2" lengthAdjust="spacing" fill="#006c8c" font-weight="700">Esc</text>
+<text xml:space="preserve" x="681.6" y="659.0" textLength="67.2" lengthAdjust="spacing" fill="#2b2f36"> back   </text>
+<text xml:space="preserve" x="748.8" y="659.0" textLength="8.4" lengthAdjust="spacing" fill="#006c8c" font-weight="700">q</text>
+<text xml:space="preserve" x="757.2" y="659.0" textLength="184.8" lengthAdjust="spacing" fill="#2b2f36"> quit                 </text>
+</svg>
