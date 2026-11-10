@@ -9,7 +9,10 @@ and one layer's sorted rows, through StreamingSwitchGLU._call_grouped.
   3. the copies go where the switches say: OVERLAP alternates the ring halves with at most a half a copy, ONECALL alone
      fills the whole ring a round, and ONECALL makes fewer copies than the groups;
   4. MemBudget._fit on CUDA drops every store due for a rebuild before it builds any, so a build that fails (another
-     program took the freed VRAM) still leaves the big store given back.
+     program took the freed VRAM) still leaves the big store given back;
+  5. MOE_RESIDENT_LM: one call over several pieces' rows (the pieces' bounds in `_lmr`) gives every row the bits its
+     own piece's call gives, the heavy group dense in the wide pieces and on the chain in the narrow one, with fewer
+     copies than the pieces make apart.
 
     perl -e 'alarm shift; exec @ARGV' 280 python3 tests/test_resident_units.py
 """
@@ -118,6 +121,37 @@ def run(g, store, views, x, uid, pos, order, overlap, onecall, log):
     y = g._call_grouped(x, uid, pos, mx.array(order.astype(np.uint32)), None, len(order), store)
     mx.eval(y)
     return np.array(y.astype(mx.float32))
+
+
+def check_lmr(g, store, views, rng, log):
+    """Four pieces (33, 64, 5 and 33 positions) apart, then as one MOE_RESIDENT_LM call; each row must match."""
+    sizes = (33, 64, 5, 33)
+    xs, idxs = [], []
+    for t in sizes:
+        idxs.append(routing(rng, t)[0])
+        xs.append(mx.array(rng.standard_normal((t, 1, HID)).astype(np.float32)).astype(mx.bfloat16))
+    apart, n_apart = [], 0
+    for x, idx in zip(xs, idxs):
+        flat = idx.ravel()
+        order = np.argsort(flat, kind="stable")
+        uid, pos = np.unique(flat[order], return_inverse=True)
+        apart.append(run(g, store, views, x, uid, pos, order, True, True, log))
+        n_apart += len(log)
+    flat = np.concatenate(idxs).ravel()
+    order = np.argsort(flat, kind="stable")
+    uid, pos = np.unique(flat[order], return_inverse=True)
+    at = np.cumsum((0,) + sizes)
+    g._lmr = [(int(a), int(b)) for a, b in zip(at, at[1:])]
+    try:
+        y = run(g, store, views, mx.concatenate(xs), uid, pos, order, True, True, log)
+    finally:
+        del g._lmr
+    ref = np.concatenate(apart)
+    bad = int((y.view(np.uint32) != ref.view(np.uint32)).sum())
+    assert bad == 0, f"layer-major: {bad} of {y.size} values differ from the pieces' own calls"
+    assert len(log) < n_apart, (len(log), n_apart)
+    print(f"  layer-major: pieces {sizes} in one call bit-equal to each piece's own, {len(log)} copies against "
+          f"{n_apart} apart")
 
 
 def check_fit_order():
@@ -231,6 +265,7 @@ def main():
             print(f"  {n_pos} positions: {len(flat)} rows (the heavy group's {int((flat < 8).sum())} on the {'dense path' if heavy else 'chain'}), main {n_main} copies, "
                   f"overlap {len(got['overlap'])}, onecall {len(got['onecall'])} (sizes "
                   f"{[n for n, _ in got['onecall']]}), both {len(got['both'])}: bit-equal to main")
+        check_lmr(g, store, views, rng, log)
         sf._NATIVE, sf._CUDA_STAGE = None, None
     print("test_resident_units: ok")
 

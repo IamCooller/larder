@@ -288,6 +288,124 @@ def tail(y, scores, shared, gate):
                                 output_shapes=[(1, 1, d)], output_dtypes=[y.dtype])[0]
 
 
+# MOE_CUDA_BIAS_TAIL (stream_fast): the same two-launch form for CacheBiasedMoE's decode row at a cache bias above
+# 0, where the router is softmax, then route()'s table-mode bias, top-k and budget, then take_along_axis and the
+# renormalisation (ten launches with the combine). bias_probs() is probs()' softmax (lane l holding [8l, 8l + 8))
+# followed by _SRC's selection on those gates, each step copied from the kernel that was checked bit for bit; the
+# combine is tail() as at bias 0. One warp a row (T <= MAX_T rows, one block).
+_SRC_BPROBS = """
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<32>(block);
+  const unsigned FULL = 0xffffffffu;
+  const int lane = threadIdx.x & 31;
+  const int r = threadIdx.x >> 5;
+  __shared__ T sg[NROWS * 256];
+  __shared__ unsigned pk[NROWS * 2 * KT];
+  int sl[8];
+  for (int i = 0; i < 8; ++i) sl[i] = slot_of[lane * 8 + i];     // the table lives in host memory: read it first
+  float v[8];
+  for (int i = 0; i < 8; ++i) v[i] = static_cast<float>(logits[r * 256 + lane * 8 + i]);
+  float prevmax = Limits<float>::finite_min();
+  float maxval = prevmax;
+  float normalizer = 0.0f;
+  for (int i = 0; i < 8; ++i) maxval = cg::greater<float>()(maxval, v[i]);
+  normalizer = normalizer * __expf(prevmax - maxval);
+  for (int i = 0; i < 8; ++i) normalizer = normalizer + __expf(v[i] - maxval);
+  prevmax = maxval;
+  maxval = cg::reduce(warp, maxval, cg::greater<float>());
+  normalizer = normalizer * __expf(prevmax - maxval);
+  normalizer = cg::reduce(warp, normalizer, cg::plus<float>());
+  normalizer = __shfl_sync(FULL, normalizer, 0);
+  normalizer = 1 / normalizer;
+  float gl[8];
+  float lmx = -INFINITY, lmn = INFINITY;
+  for (int i = 0; i < 8; ++i) {
+    const T g = static_cast<T>(__expf(v[i] - maxval) * normalizer);
+    sg[r * 256 + lane * 8 + i] = g;
+    gl[i] = static_cast<float>(g);
+    lmx = fmaxf(lmx, gl[i]);
+    lmn = fminf(lmn, gl[i]);
+  }
+  for (int m = 16; m > 0; m >>= 1) {
+    lmx = fmaxf(lmx, __shfl_xor_sync(FULL, lmx, m));
+    lmn = fminf(lmn, __shfl_xor_sync(FULL, lmn, m));
+  }
+  const T sp = static_cast<T>(lmx) - static_cast<T>(lmn);
+  const T ls = static_cast<T>(lam[0]) * sp;
+  const float lsf = static_cast<float>(ls);
+  float mk[8];
+  for (int i = 0; i < 8; ++i) mk[i] = (sl[i] >= 0 && sl[i] < lim[0]) ? 1.0f : 0.0f;
+  for (int p = 0; p < (BUDGET ? 2 : 1); ++p) {
+    float rk[8];
+    for (int i = 0; i < 8; ++i) rk[i] = (p == 0) ? __fadd_rn(gl[i], __fmul_rn(lsf, mk[i])) : gl[i];
+    for (int j = 0; j < KT; ++j) {
+      float bv = -INFINITY;
+      int bi = -1;
+      for (int i = 0; i < 8; ++i) {
+        if (rk[i] >= bv) { bv = rk[i]; bi = lane * 8 + i; }
+      }
+      for (int m = 16; m > 0; m >>= 1) {
+        const float ov = __shfl_xor_sync(FULL, bv, m);
+        const int oi = __shfl_xor_sync(FULL, bi, m);
+        if (ov > bv || (ov == bv && oi > bi)) { bv = ov; bi = oi; }
+      }
+      if (lane == 0) pk[(r * 2 + p) * KT + KT - 1 - j] = (unsigned)bi;
+      for (int i = 0; i < 8; ++i) {
+        if (lane * 8 + i == bi) rk[i] = -INFINITY;
+      }
+    }
+  }
+  __syncthreads();
+  bool back = false;
+  if (BUDGET) {
+    constexpr int NR = 16 / sizeof(T);
+    T mh = static_cast<T>(0.0f), mb = static_cast<T>(0.0f);
+    for (int i = 0; i < NR; ++i) {
+      const int j = lane * NR + i;
+      const T vh = (j < KT) ? sg[r * 256 + pk[(r * 2 + 1) * KT + j]] : static_cast<T>(0.0f);
+      const T vb = (j < KT) ? sg[r * 256 + pk[(r * 2) * KT + j]] : static_cast<T>(0.0f);
+      mh = mh + vh;
+      mb = mb + vb;
+    }
+    for (int m = 16; m > 0; m >>= 1) {
+      mh = mh + __shfl_xor_sync(FULL, mh, m);
+      mb = mb + __shfl_xor_sync(FULL, mb, m);
+    }
+    back = (mh - mb) > (static_cast<T>(tau[0]) * mh);
+  }
+  const unsigned* sel = pk + (r * 2 + (back ? 1 : 0)) * KT;
+  if (lane < KT) {
+    const unsigned e = sel[lane];
+    T s = sg[r * 256 + e];
+    if (NORM) {
+      T sum = static_cast<T>(0.0f);
+      for (int j = 0; j < KT; ++j) sum = __hadd_rn(sum, sg[r * 256 + sel[j]]);
+      s = s / sum;
+    }
+    inds[r * KT + lane] = e;
+    scores[r * KT + lane] = s;
+  }
+"""
+
+
+def bias_probs(logits, slot_of, lam, tau, k, lim, norm):
+    """CacheBiasedMoE's decode router at a cache bias above 0 for [1, T, 256] bf16 gate logits (T <= MAX_T, k <= 8):
+    softmax(precise), the bias toward 0 <= slot_of < lim, top-k, the budget, take_along_axis and with `norm` the
+    renormalisation -> (inds uint32 [1, T, k], scores [1, T, k] in the logits' dtype)."""
+    _, t, e = logits.shape
+    assert e == 256 and t <= MAX_T and 0 < k <= 8 and lam > 0.0, (logits.shape, k, lam)
+    kern = _KERNELS.get("bprobs")
+    if kern is None:
+        kern = _KERNELS["bprobs"] = mx.fast.cuda_kernel(
+            name="moe_bias_probs", input_names=["logits", "slot_of", "lam", "tau", "lim"],
+            output_names=["inds", "scores"], header=_TAIL_HEADER, source=_SRC_BPROBS)
+    return kern(inputs=[logits, slot_of, _scalar(float(lam), mx.float32), _scalar(float(tau), mx.float32),
+                        _scalar(int(lim), mx.int32)],
+                template=[("T", logits.dtype), ("KT", k), ("NROWS", t), ("BUDGET", tau > 0.0), ("NORM", bool(norm))],
+                grid=(32 * t, 1, 1), threadgroup=(32 * t, 1, 1), output_shapes=[(1, t, k)] * 2,
+                output_dtypes=[mx.uint32, logits.dtype])
+
+
 def _tail_fits(block):
     g = getattr(block, "gate", None)
     return (getattr(block, "sharding_group", None) is None and isinstance(g, dict) and "weight" in g

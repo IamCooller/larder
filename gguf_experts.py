@@ -367,13 +367,16 @@ if _CUDA:
     import gguf_cuda as _backend
 else:
     import gguf_metal as _backend
+# CUDA only: the decode chain on rows sorted by slot, a weight task decoded once a run (gguf_cuda.py, _gemv_runs).
+RUN_SOURCES = {"gguf_gate_up_runs": _backend.GATE_UP_RUNS_SRC, "gguf_down_runs": _backend.DOWN_RUNS_SRC} if _CUDA else {}
 _K = {}
 _TAB = []
 
 
 def _kernel(name, ins, outs):
     if name not in _K:
-        _K[name] = _backend.kernel(name, ins, outs, SOURCES[name], HEADER)
+        _K[name] = (_backend.kernel(name, ins, outs, RUN_SOURCES[name], HEADER + _backend.RUNS_HEADER)
+                    if name in RUN_SOURCES else _backend.kernel(name, ins, outs, SOURCES[name], HEADER))
     return _K[name]
 
 
@@ -405,11 +408,25 @@ def dequant(buf, slots, t, dtype):
 RPW = [int(v) for v in os.environ.get("MOE_GGUF_RPW", "1,1").split(",")]
 # The rows a warp calibrate() times.
 RPW_TRIES = ((1, 1), (2, 1), (2, 2), (4, 1), (4, 2))
+# MOE_GGUF_RUNS (CUDA, on unless =0): rows of one slot each go through the run kernels, checked once against the chain.
+RUNS = _CUDA and os.environ.get("MOE_GGUF_RUNS", "1") != "0"
+# The run kernels' tile: rows a lane group of gate/up and of down, rows a window, warps a threadgroup (no bit depends on it).
+RUN_TILE = [int(v) for v in os.environ.get("MOE_GGUF_RUN_TILE", "2,2,8,8").split(",")]
+_RUNS_OK = {}
 
 
 def gemv(x, w, slots, topk, types, out_dtype):
     """Every slot's expert output, unweighted: x (rows, hidden), slots (rows * topk,) uint32 with slot s on row
-    s // topk, w the gate, up and down buffers [S, rows, row bytes] in `types`; returns (rows * topk, hidden)."""
+    s // topk, w the gate, up and down buffers [S, rows, row bytes] in `types`; returns (rows * topk, hidden), through
+    the run kernels under RUNS at one slot a row."""
+    inter, hid = dims(w[0], types[0])
+    if RUNS and topk == 1 and slots.size > 1 and _runs_ok(hid, inter, types, x.dtype, out_dtype):
+        return _gemv_runs(x, w, slots, types, out_dtype)[1]
+    return _chain(x, w, slots, topk, types, out_dtype)[1]
+
+
+def _chain(x, w, slots, topk, types, out_dtype):
+    """gemv() through the decode chain, a threadgroup row a slot; returns (h, out)."""
     (bg, bu, bd), (tg, tu, td) = w, types
     inter, hid = dims(bg, tg)
     n = slots.size
@@ -422,12 +439,63 @@ def gemv(x, w, slots, topk, types, out_dtype):
                   ("LPR", lg), ("RPW", RPW[0])],
         grid=(-(-inter // ng) * 128, n, 1), threadgroup=(128, 1, 1),
         output_shapes=[(n, inter)], output_dtypes=[mx.float32])[0]
-    return _kernel("gguf_down", ["h", "wd", "slots", "tab"], ["y"])(
+    return h, _kernel("gguf_down", ["h", "wd", "slots", "tab"], ["y"])(
         inputs=[h, bd, slots, _tab()],
         template=[("TD", TYPES[td][0]), ("IN", inter), ("OUT", hid), ("LPR", ld), ("TY", out_dtype),
                   ("RPW", RPW[1])],
         grid=(-(-hid // nd) * 128, n, 1), threadgroup=(128, 1, 1),
         output_shapes=[(n, hid)], output_dtypes=[out_dtype])[0]
+
+
+def _gemv_runs(x, w, slots, types, out_dtype):
+    """gemv() on rows of one slot each, best sorted by slot, through the run kernels; returns (h, out)."""
+    (bg, bu, bd), (tg, tu, td) = w, types
+    inter, hid = dims(bg, tg)
+    n = slots.size
+    lg, ld = _lpr(hid), _lpr(inter)
+    rg, rd, tr, nw = RUN_TILE
+    # A window's rows fit the 48 KB of static shared memory a threadgroup has.
+    trg, trd = max(1, min(tr, 49152 // (hid * x.dtype.size))), max(1, min(tr, 49152 // (inter * 4)))
+    ng, nd = nw * 32 // lg * rg, nw * 32 // ld * rd
+    h = _kernel("gguf_gate_up_runs", ["x", "wg", "wu", "slots", "tab"], ["h"])(
+        inputs=[x, bg, bu, slots, _tab()],
+        template=[("TG", TYPES[tg][0]), ("TU", TYPES[tu][0]), ("IN", hid), ("OUT", inter), ("LPR", lg), ("RPW", rg),
+                  ("TR", trg), ("NW", nw), ("TX", x.dtype)],
+        grid=(-(-inter // ng) * 32 * nw, -(-n // trg), 1), threadgroup=(32 * nw, 1, 1),
+        output_shapes=[(n, inter)], output_dtypes=[mx.float32])[0]
+    return h, _kernel("gguf_down_runs", ["h", "wd", "slots", "tab"], ["y"])(
+        inputs=[h, bd, slots, _tab()],
+        template=[("TD", TYPES[td][0]), ("IN", inter), ("OUT", hid), ("LPR", ld), ("RPW", rd), ("TR", trd),
+                  ("NW", nw), ("TY", out_dtype)],
+        grid=(-(-hid // nd) * 32 * nw, -(-n // trd), 1), threadgroup=(32 * nw, 1, 1),
+        output_shapes=[(n, hid)], output_dtypes=[out_dtype])[0]
+
+
+def _same_bits(a, b):
+    u = {4: mx.uint32, 2: mx.uint16}[a.dtype.size]
+    return a.shape == b.shape and bool(mx.array_equal(a.view(u), b.view(u)))
+
+
+def _runs_ok(hid, inter, types, x_dtype, out_dtype):
+    """The run kernels at these shapes and dtypes, checked once: on only if bit-equal to the chain on random experts
+    and sorted runs of 1 to 16 rows."""
+    key = (hid, inter, tuple(types), str(x_dtype), str(out_dtype))
+    if key not in _RUNS_OK:
+        _RUNS_OK[key] = False
+        try:
+            rng = np.random.default_rng(5)
+            w = tuple(mx.array(random_experts(rng, 6, r, c, t))
+                      for (r, c), t in zip(((inter, hid), (inter, hid), (hid, inter)), types))
+            lens = rng.permutation(np.arange(1, 17))
+            slots = mx.array(np.repeat(rng.integers(0, 6, len(lens)), lens).astype(np.uint32))
+            x = mx.array(rng.standard_normal((slots.size, hid)).astype(np.float32)).astype(x_dtype)
+            ok = all(map(_same_bits, _chain(x, w, slots, 1, types, out_dtype), _gemv_runs(x, w, slots, types, out_dtype)))
+            why = "" if ok else "differs from the decode chain"
+        except Exception as e:      # a kernel that does not build here
+            ok, why = False, f"{type(e).__name__}: {str(e)[:200]}"
+        _RUNS_OK[key] = ok
+        print(f"  gguf: run kernels {'on, bit-equal to the decode chain' if ok else 'off: ' + why}", flush=True)
+    return _RUNS_OK[key]
 
 
 def _lpr(length):
@@ -491,7 +559,7 @@ def _measure(hid, inter, types):
     def secs(u, p, dense_path):
         host = (np.arange(p) % u).astype(np.uint32)
         f = (lambda: dense(x[:p], w, host, types, x.dtype)) if dense_path else \
-            (lambda: gemv(x[:p], w, mx.array(host), 1, types, x.dtype))
+            (lambda: _chain(x[:p], w, mx.array(host), 1, types, x.dtype)[1])
         mx.eval(f())
         best = float("inf")
         for _ in range(5):
@@ -539,6 +607,8 @@ def calibrate(hid, inter, types):
         except OSError as e:
             print(f"  gguf: could not save the prefill switch to {path}: {e}", flush=True)
     RPW[:] = [int(v) for v in os.environ["MOE_GGUF_RPW"].split(",")] if "MOE_GGUF_RPW" in os.environ else rpw
+    if RUNS:
+        _runs_ok(hid, inter, tuple(types), mx.bfloat16, mx.bfloat16)     # built and checked at load, not on the first prompt
     return _COST
 
 

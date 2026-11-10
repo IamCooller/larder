@@ -103,6 +103,7 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_ane_experts.py` | ANE expert programs' GPU kernels against fp32 GEMMs, to fp16 precision. | toy | - | under 10 s | `python3 tests/test_ane_experts.py` |
 | `test_gguf_repack.py` | tools/gguf_repack.py on a synthetic two-shard GGUF: records, layout, resume. | toy | - | under 10 s | `python3 tests/test_gguf_repack.py` |
 | `test_gguf_engine.py` | GGUF routed experts through the engine equal the reference model's tokens on a toy MoE. | toy | - | 10 s | `python3 tests/test_gguf_engine.py` |
+| `test_gguf_runs.py` | The CUDA run kernels (a weight task decoded once a run of rows) equal the decode chain bit for bit, h and out. | toy, needs CUDA | - | 50 s | `python3 tests/test_gguf_runs.py` |
 | `test_cpu_guess.py` | The CPU routing guess (native/cpu_guess.h) against numpy and MLX. | toy, needs a build | clang++ | under 10 s | `python3 tests/test_cpu_guess.py` |
 | `test_cpu_kern.py` | cpu_kern against a float64 numpy reference and MLX's CPU ops. | toy, needs a build | cpu_ext/build.sh | under 10 s | `python3 tests/test_cpu_kern.py` |
 | `test_kv_compat.py` | KV cache keys and values round-trip through mlx-lm's two-value and three-value state setters. | toy | - | 10 s | `python3 tests/test_kv_compat.py` |
@@ -177,10 +178,13 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_native_coherent.py` | wait_for hands the gather the slot table the agent just wrote. | toy, needs a build | native/build.sh | under 10 s | `python3 tests/test_native_coherent.py` |
 | `test_native_exit.py` | A MOE_NATIVE=1 process cannot leave the GPU spinning after it is gone (macOS). | toy, needs a build | native/build.sh | under 10 s | `python3 tests/test_native_exit.py` |
 | `test_native_exit_cuda.py` | The same exit test on NVIDIA, plus a lone KILL. | toy, runs on a CUDA PC | CUDA | under 10 s | `python3 tests/test_native_exit_cuda.py` |
+| `test_native_batch_cuda.py` | MOE_CUDA_EVAL_EVERY and MOE_CUDA_TOKEN_AHEAD decode the defaults' tokens (bias on), with fewer async_evals. | toy, runs on a CUDA PC | CUDA | under a minute | `python3 tests/test_native_batch_cuda.py` |
 | `test_staging.py` | MOE_STAGING rows in the native agent equal the Python path. | toy, needs a build | native/build.sh | under 10 s | `python3 tests/test_staging.py` |
 | `test_pipe_staging_emu.py` | MOE_PIPE_STAGING and PIECES with moe_pipe_cuda built for the host and a stand-in libcuda. | toy, needs a build | g++ | 46 s | `python3 tests/test_pipe_staging_emu.py` |
 | `test_gdn_cuda.py` | MOE_CUDA_GDN: the CUDA gated delta kernel; off-CUDA it must never load. | toy | - | under 10 s | `python3 tests/test_gdn_cuda.py` |
 | `test_route_cuda.py` | MOE_CUDA_ROUTE: the cache-bias route as one CUDA kernel; off-CUDA it must never load. | toy | - | under 10 s | `python3 tests/test_route_cuda.py` |
+| `test_bias_tail_cuda.py` | MOE_CUDA_BIAS_TAIL: the biased router and the combine as two CUDA kernels equal the block's own ops bit for bit. | toy, needs CUDA | - | under a minute | `python3 tests/test_bias_tail_cuda.py` |
+| `test_gdn_glue_cuda.py` | MOE_CUDA_GDN_GLUE: the gated delta decode row in two CUDA kernels equals mlx_lm's own lines, outputs and states. | toy, needs CUDA | - | under a minute | `python3 tests/test_gdn_glue_cuda.py` |
 | `test_qsa_cuda.py` | The CUDA QSA decode path and its switch point. | toy, runs on a CUDA PC | - | under 10 s | `python3 tests/test_qsa_cuda.py` |
 | `test_kv_host.py` | MOE_KV_HOST on CUDA: flag-off equality. | toy, runs on a CUDA PC | - | 14 s | `python3 tests/test_kv_host.py` |
 

@@ -54,6 +54,9 @@ tests/test_window_cache.py
 tests/test_native.py
 tests/test_native_coherent.py
 tests/test_native_exit_cuda.py
+tests/test_native_batch_cuda.py
+tests/test_bias_tail_cuda.py
+tests/test_gdn_glue_cuda.py
 tests/test_pipe_staging_emu.py
 tests/test_native_exit.py
 tests/test_staging.py
@@ -68,6 +71,7 @@ tests/test_cuda_resident.py
 tests/test_cuda_spans.py
 tests/test_gguf_repack.py
 tests/test_gguf_engine.py
+tests/test_gguf_runs.py
 tests/test_kv_host.py
 tests/test_kv_host_emu.py
 tests/test_lm_copy_whole.py
