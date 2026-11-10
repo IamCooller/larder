@@ -144,6 +144,9 @@ _LINUX = sys.platform.startswith("linux")
 if BACKEND == "cuda" and os.environ.get("MOE_CUDA_GDN", "1") == "1":
     import gdn_cuda
     gdn_cuda.install()
+    # MOE_CUDA_GDN_GLUE (on under MOE_RESIDENT unless =0, =1 elsewhere): qwen3_5's GatedDeltaNet decode row in two kernels around the recurrence (gdn_cuda.install_glue).
+    if os.environ.get("MOE_CUDA_GDN_GLUE", "1" if os.environ.get("MOE_RESIDENT") == "1" else "0") == "1":
+        gdn_cuda.install_glue()
 
 # MOE_CPU_KERNELS (on by default on MLX's CPU device, never on Metal or CUDA): cpu_ext's threaded AVX-512 kernels for the quantized matmuls, the expert gather, attention and the GatedDeltaNet scan (cpu_kernels.py).
 if BACKEND == "cpu" and os.environ.get("MOE_CPU_KERNELS", "1") == "1":
@@ -168,6 +171,9 @@ _INPLACE = os.environ.get("MOE_RESIDENT_INPLACE", "1") != "0"
 _OVERLAP = os.environ.get("MOE_RESIDENT_OVERLAP", "1") != "0"
 # MOE_RESIDENT_ONECALL (on unless =0): a GGUF prefill layer's chain rows of quota experts go in one call and its misses in rounds through the ring, instead of ~20 groups.
 _ONECALL = os.environ.get("MOE_RESIDENT_ONECALL", "1") != "0"
+# MOE_RESIDENT_LM=K (MOE_RESIDENT on a GGUF pack whose layers the layer-major code cuts, 8 unless set, 0 or 1 off): a prefill runs K of the plan's pieces at a time layer-major, each piece's dense part and routing as its own pass computes them and the experts once over the K pieces' rows, so a miss crosses PCIe once per K pieces.
+_LMR_K = int(os.environ.get("MOE_RESIDENT_LM", "8")) if _RESIDENT else 0
+_LMR_BOUNDS = None      # the running layer-major run's pieces as position bounds (stack_call), None outside one
 # The fresh prefill the resident store leaves room for beside it, in min_w passes (MLX's sorted-kernel line, 128 positions on the 35B), since at two the 144-token bench prompt was cut in two pieces.
 RESIDENT_ROOM = 4
 # MOE_EMBED_VRAM (on under MOE_RESIDENT unless =0): the embedding table stays in device memory instead of a row read from the checkpoint and dequantized every token.
@@ -176,6 +182,32 @@ EMBED_VRAM = _RESIDENT and os.environ.get("MOE_EMBED_VRAM", "1") == "1"
 _DENSE_VRAM = _RESIDENT and os.environ.get("MOE_DENSE_VRAM") == "1"
 # MOE_FUSE_PROJ=1 (CUDA only, off by default: no gain measured on the resident 35B): projections that read the same row in one matvec (fuse_proj.py).
 _FUSE_PROJ = BACKEND == "cuda" and os.environ.get("MOE_FUSE_PROJ") == "1"
+# MOE_CUDA_EVAL_EVERY=N (CUDA native decode; 8 under MOE_RESIDENT, else 1): one mx.async_eval hands N MoE layers to the GPU instead of one.
+_EVAL_EVERY = os.environ.get("MOE_CUDA_EVAL_EVERY")
+# MOE_CUDA_TOKEN_AHEAD (CUDA native decode; on under MOE_RESIDENT unless =0, =1 elsewhere): a native token's pass waits neither for the token before's GPU tail nor for the agent, and its end (settle) checks that token's jobs were answered.
+_TOKEN_AHEAD = os.environ.get("MOE_CUDA_TOKEN_AHEAD")
+if BACKEND == "cuda" and _RESIDENT_ASKED and _EVAL_EVERY != "1":
+    # A decode graph then spans that many layers, which MLX would cut at 100 ops and at 1000 MB of inputs (the 12 GB store counts in each chain kernel); MLX reads these at its first graph.
+    os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "800")
+    os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "1000000")
+
+
+def _eval_every():
+    return max(1, int(_EVAL_EVERY)) if _EVAL_EVERY else (8 if _RESIDENT else 1)
+
+
+def _resident_switch(name, on=True):
+    """A CUDA decode lever's env switch: =1 on, =0 off, unset on under MOE_RESIDENT when `on`."""
+    v = os.environ.get(name)
+    return BACKEND == "cuda" and (v == "1" if v is not None else on and _RESIDENT)
+
+
+# MOE_CUDA_BIAS_TAIL (CUDA native decode at a cache bias above 0; on under MOE_RESIDENT unless =0, =1 elsewhere): the router, the bias, the budget and the weights in one kernel and the combine in a second (route_cuda.bias_probs, route_cuda.tail), as the unbiased block runs.
+_BIAS_TAIL = _resident_switch("MOE_CUDA_BIAS_TAIL")
+
+
+def _token_ahead():
+    return BACKEND == "cuda" and (_RESIDENT if _TOKEN_AHEAD is None else _TOKEN_AHEAD == "1")
 
 # MOE_KV_HOST=1 (CUDA only, off by default): the QSA layers' K/V in pinned host RAM past a length, their VRAM going to the expert store (kv_host.py, imported only when on).
 _KV_HOST = BACKEND == "cuda" and os.environ.get("MOE_KV_HOST") == "1"
@@ -1340,6 +1372,8 @@ class MemBudget:
         self.pieces = []        # widths of the last prefill's passes on one cache
         # Layer-major prefill (lm_supported, enable_budget): its passes' growth beside their state by width, of every pass (lm_seen) and of the fresh ones only (lm_fresh), which are the ones a room is compared to, with lm_ok for a stack call that may run it and lm_pass for the pass that does.
         self.layer_major = self.lm_ok = self.lm_pass = False
+        self.lmr = False        # MOE_RESIDENT_LM runs (enable_budget), and the most a run grew MLX by a position
+        self.lmr_pos = 0.0
         self._lm_seen, self._lm_fresh, self._lm_rows, self._rows_top = {}, {}, {}, 0
         # The width this pass is cut to (LM_W unless the keys leave no room for a chunk that wide) and the narrowest it may go, since a chunk's attention grows with the keys and a fixed LM_W paid 6.4 GB for scores at 64k.
         self.lm_w, self.min_chunk = LM_W, ATTN_CHUNK_MIN
@@ -1600,7 +1634,9 @@ class MemBudget:
         global _MEASURING
         if _KV_HOST:
             kv_host.drop_live()
-        _eval_caches(caches)
+        # MOE_CUDA_TOKEN_AHEAD: a decode pass after a native one holds the caches that pass left, not a lazy front, so it does not wait for them.
+        if not (n == 1 and not fresh and _NATIVE is not None and _NATIVE.owner == "agent" and _token_ahead()):
+            _eval_caches(caches)
         self._ticks += 1
         after = self.prefill
         self.prefill = self._is_prefill(n, fresh)
@@ -2144,7 +2180,7 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
         orig = cls.__call__
 
         def stack_call(self, inputs, *args, **kwargs):
-            global _MEASURING
+            global _MEASURING, _LMR_BOUNDS
             bud = self.__dict__.get("_mem_budget")
             if bud is None:
                 return orig(self, inputs, *args, **kwargs)
@@ -2174,11 +2210,30 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
                                         min(n - a, PROBE_MULT * bud.min_w),
                                         self, orig, args, kwargs)
                         w = bud.plan(n - a, fresh, caches)
-                    # Cut here at the stack, so every caller's prefill (a front, a turn, MTP's) is the passes a caller-chunked one would be, and the rest plans again at its own entry.
-                    part, kw = (inputs, {}) if w == n else _cut(inputs, emb, a, a + w)
                     bud.tick(w, fresh, caches)
-                    ys.append(orig(self, part, *args, **{**kwargs, **kw}))
-                    a += w
+                    # MOE_RESIDENT_LM: up to K pieces of the plan's width at once, layer-major, each the piece a token-major pass would be, once a piece's growth is known (the budget measures pieces only); a stoppable or resumed pass stays token-major.
+                    span = w
+                    if (bud.lmr and not whole and w < n - a and bud._is_prefill(w, fresh)
+                            and bud.rate is not None and bud.state is not None
+                            and PREFILL_STOP is None and PREFILL_SKIP is None):
+                        span = min(n - a, _lmr_pieces(bud, w) * w)
+                    # Cut here at the stack, so every caller's prefill (a front, a turn, MTP's) is the passes a caller-chunked one would be, and the rest plans again at its own entry.
+                    part, kw = (inputs, {}) if span == n else _cut(inputs, emb, a, a + span)
+                    if span > w:
+                        # A run of pieces is not measured as a piece (its growth would read as one piece's) but as a run, a position at a time.
+                        bud._pass = None
+                        _LMR_BOUNDS = [(c, min(c + w, span)) for c in range(0, span, w)]
+                        a0 = mx.get_active_memory()
+                        mx.reset_peak_memory()
+                    try:
+                        ys.append(orig(self, part, *args, **{**kwargs, **kw}))
+                    finally:
+                        _LMR_BOUNDS = None
+                    if span > w:
+                        # chunkattn's bracket resets the peak and keeps what it saw in _top; the run's buffers go back to the device, not to the decode after it.
+                        bud.lmr_pos = max(bud.lmr_pos, (max(bud._top, mx.get_peak_memory()) - a0) / span)
+                        mx.clear_cache()
+                    a += span
                     if _R3 and a < n:
                         # R3: a lazy output held the last layer's hidden state ([w, 4 x 2560] on Flash-Next, ~20 KB a position) until the concatenation below, and evaluated it holds its own rows only (5 KB).
                         mx.eval(ys[-1])
@@ -2193,6 +2248,7 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
     stack.__dict__["_mem_budget"] = b
     # MOE_RESIDENT keeps the store through a prefill, and a layer-major pass reads into the whole store.
     b.layer_major = lm_supported(model) and not _RESIDENT
+    b.lmr = _LMR_K > 1 and _lmr_supported(model, glus)
     note(f"  memory budget: peak {peak_gb:.2f} GB | shared stores for "
           f"{len(b.groups)} expert shape(s) | ring {b.halves}x{b.per_half} "
           f"slots each = {b.ring_bytes / 1e6:.1f} MB | prefills of {b.min_w}+ "
@@ -2381,6 +2437,10 @@ _STAGING_ROWS = 16 if _STAGE in ("1", "dry") else 0
 _PIPE_STAGING = _NATIVE_ENV and BACKEND == "cuda" and os.environ.get("MOE_PIPE_STAGING", "1") == "1"
 # MOE_PIPE_GUESS_D (staging, default 1): the guess posted beside layer L's job names layer L + D's experts (L + D's gate on L's MoE input).
 _PIPE_GUESS_D = int(os.environ.get("MOE_PIPE_GUESS_D", "1"))
+# MOE_PIPE_GUESS_BF16=1 (staging, off by default: -0.13 ms a token, under step 0's bar): the guess ranks L + D's gate on L's bf16 MoE input as it comes, with no f32 casts of the input and of the gate's scales; a guess only steers which misses are read ahead, so the claims, tables and replies are the same.
+_GUESS_BF16 = _resident_switch("MOE_PIPE_GUESS_BF16", on=False)
+# MOE_PIPE_ONE (CUDA native passes, pieces mode; on under MOE_RESIDENT unless =0, =1 elsewhere): the post, the guess and the wait of a layer in one kernel, which does not wait for the agent's claim when the slot table holds every id (moe_pipe_cuda.sync_rows).
+_PIPE_ONE = _resident_switch("MOE_PIPE_ONE")
 # MOE_PIPE_HITS_FIRST=1 (CUDA native passes on an EXL3 pack, off by default): the layer's held experts run between its job's post and its wait, the missed ones after it, each slot's output the same bits.
 _PIPE_HITS = _NATIVE_ENV and BACKEND == "cuda" and os.environ.get("MOE_PIPE_HITS_FIRST", "0") == "1"
 _HITS_SKIP = None        # its rows' "not held" mark as a uint32 array, made once at install
@@ -2425,8 +2485,14 @@ class _Native:
         # CUDA: the handshake kernels run once before the agent exists, and the first decode pass after install runs on the Python path, so no kernel loads for the first time while a wait is pending.
         self.cuda = BACKEND == "cuda"
         self.warm, self.holds, self.hold_s = not self.cuda, 0, 0.0
+        global _PIPE_ONE
+        if _PIPE_ONE and not getattr(nv, "_PIECES", False):
+            note("  MOE_PIPE_ONE: off, it needs MOE_PIPE_PIECES", flush=True)
+            _PIPE_ONE = False
         if self.cuda and top_k_of(model):
             nv.warm(top_k_of(model))
+            if _PIPE_ONE:
+                nv.warm_one(top_k_of(model))
         self.pipe_stage = _PIPE_STAGING
         if self.pipe_stage:
             # Every layer but the last D guesses layer L + D's experts, the post kernel warmed before the agent exists as warm()'s are.
@@ -2435,7 +2501,9 @@ class _Native:
                 m = mlp_of[id(nxt)]
                 m = m.block if isinstance(m, CacheBiasedMoE) else m
                 g._guess_next = _pipe_guess(m.gate, m.top_k)
-                nv.warm_guess(m.gate.weight.shape[0], m.top_k)
+                nv.warm_guess(m.gate.weight.shape[0], m.top_k, mx.bfloat16 if _GUESS_BF16 else mx.float32)
+                if _PIPE_ONE:
+                    nv.warm_one(top_k_of(model), m.gate.weight.shape[0], mx.bfloat16 if _GUESS_BF16 else mx.float32)
         if _PIPE_HITS and top_k_of(model):
             # The held experts' chain needs the EXL3 kernels' skipped slots; another pack keeps one chain after the wait.
             for g in glus:
@@ -2476,6 +2544,8 @@ class _Native:
         self.owner = "py"
         self.active = False
         self.v = 1                      # the GPU raises the word to v, the agent to v + 1
+        self.unsent = 0                 # CUDA: jobs built but not yet handed to the GPU (MOE_CUDA_EVAL_EVERY)
+        self.ahead = None               # MOE_CUDA_TOKEN_AHEAD: the token before's last job, checked by settle()
         self.k = top_k_of(model)
         self.stage = _STAGE == "1"      # staging rows (set_staging at begin)
         self.cpu = False                # MOE_CPU_GUESS's routers handed over (_cpu_routers)
@@ -2499,7 +2569,12 @@ class _Native:
 
     def begin(self, T=1):
         """Token boundary of a native pass of T positions with the token before it done, False sending the pass to Python (an arena missing, or just resized)."""
-        self.drain()
+        # MOE_CUDA_TOKEN_AHEAD: after a native token nothing below needs the agent idle, so settle() checks that token's jobs at this pass's end.
+        steady = self.cuda and T == 1 and self.owner == "agent" and _token_ahead()
+        self.ahead = int(self.nv._blk[self.nv.SENT]) if steady else None
+        if not steady:
+            self.drain()
+        self.unsent = 0
         if _GOV is not None:
             for _ in self.glus:          # what the sync path ticks per layer
                 _GOV.tick(False, T)
@@ -2642,6 +2717,22 @@ class _Native:
             # A job the GPU never reached or a read that hangs lets every wait through (a raised word can be lowered again by a later signal on the GPU, the stop word cannot) before it stops.
             self.nv.release()
             self.fail("the agent did not go idle in 30 s")
+        self._check()
+
+    def settle(self):
+        """MOE_CUDA_TOKEN_AHEAD, at the end of a pass whose start did not drain: the token before's jobs answered (long since, with the GPU a few layers behind the host) and checked before that token is handed out."""
+        if self.ahead is None:
+            return
+        t = time.perf_counter()
+        while int(self.nv._blk[self.nv.DONE]) < self.ahead:
+            if time.perf_counter() - t > 30.0:
+                self.nv.release()
+                self.fail("the agent did not answer the token before in 30 s")
+            time.sleep(1e-4)
+        self.ahead = None
+        self._check()
+
+    def _check(self):
         if self.agent.error:
             self.fail(self.agent.error)
         # Checked at every token boundary: the token before was computed (stack_call evaluated it) but not yet handed out.
@@ -2702,8 +2793,8 @@ class _Native:
         want = self.tier_gov.tick(T, idle)
         if want is None:
             return
-        if idle:
-            self.drain()
+        if idle or self.ahead is not None:
+            self.drain()            # MOE_CUDA_TOKEN_AHEAD's begin did not
         mx.synchronize()            # no copy of the last pass reads or writes the tier any more
         t, old = time.perf_counter(), self.tier_gov.n
         self.tier_gov.n = self.agent.set_tier(self.tier_slot, want)
@@ -2796,7 +2887,9 @@ def install_native(model, glus, readers):
                 nat.to_python()
                 return sorig(self, inputs, *args, **kwargs)
             # The token before must be done, since its claims are what this one's cache bias ranks against and the agent's table is read here.
-            mx.eval(inputs)
+            # MOE_CUDA_TOKEN_AHEAD, after a native token: each router reads its own layer's slot table on the GPU, in GPU order, so the wait buys nothing.
+            if not (nat.cuda and T == 1 and nat.owner == "agent" and _token_ahead()):
+                mx.eval(inputs)
             if nat.begin(T):
                 STATS["native_rows"] += T > 1
                 nat.active = True
@@ -2805,6 +2898,7 @@ def install_native(model, glus, readers):
                     if T == 1:
                         ple = _ple_decode_ahead(self, inputs, args[0] if args else kwargs.get("cache"))
                     out = sorig(self, inputs, *args, **kwargs)
+                    nat.settle()
                     ok = True
                     return out
                 finally:
@@ -3676,6 +3770,8 @@ class CacheBiasedMoE(nn.Module):
     def _keys(self):
         """The residency the router ranks against: the host LRU of the layer, the pre-claim view a repaired layer is held to, or on a native pass the agent's slot table."""
         if _NATIVE is not None and _NATIVE.active:
+            # MOE_CUDA_TOKEN_AHEAD: the host reads the table now, so the token before's claims must all be in (the GPU's own reads come in order).
+            _NATIVE.settle()
             glu = self.block.switch_mlp
             s = glu._slot_np
             return np.flatnonzero((s >= 0) if glu._store is None
@@ -3826,6 +3922,11 @@ class CacheBiasedMoE(nn.Module):
                 if getattr(b, "shared_expert", None) is not None:
                     y = y + self._shared_out(x, early)
                 return y
+        if (_BIAS_TAIL and self._lam > 0.0 and _NATIVE is not None and _NATIVE.active and x.ndim == 3
+                and x.shape[0] == 1 and x.shape[1] == 1 and self._tail_ok()):
+            lg = b.gate(x)
+            if lg.dtype == mx.bfloat16:
+                return self._bias_tail(x, lg)
         if (b.__dict__.get("_lgp") and self._logit_routed and "_lm" in b.switch_mlp.__dict__
                 and layer_glue.rows_ok(x) and not fused_router.on()
                 and getattr(b, "shared_expert", None) is not None):
@@ -3863,16 +3964,44 @@ class CacheBiasedMoE(nn.Module):
             y = y + self._shared_out(x, early)
         return y
 
+    def _tail_ok(self):
+        """MOE_CUDA_BIAS_TAIL serves this block: a probability-routed one route_cuda.tail fits, with its router reading the slot table as _cuda_route's table mode does."""
+        ok = self.__dict__.get("_tail_fit")
+        if ok is None:
+            ok = self.__dict__["_tail_fit"] = (not self._logit_routed and route_cuda._tail_fits(self.block)
+                                               and getattr(self.block, "norm_topk_prob", None) is not None)
+        glu = self.block.switch_mlp
+        return (ok and _CUDA_SLOTS and getattr(glu, "_slot_of", None) is not None
+                and getattr(glu, "_defer_hold", None) is None and (_KEEP or glu._lru))
+
+    def _bias_tail(self, x, lg):
+        """MOE_CUDA_BIAS_TAIL: the lines of __call__ below for one decode row in two kernels, the shared expert and its gate handed to the native pass as a pair."""
+        b, glu = self.block, self.block.switch_mlp
+        lim = glu._store.pool if glu._store is not None else 2 ** 31 - 1
+        inds, scores = route_cuda.bias_probs(lg, glu._slot_of, self._lam, _BIAS_BUDGET, self.top_k, lim,
+                                             b.norm_topk_prob)
+        early = self._mark_shared_early(x, pair=True)
+        y = glu(x, inds)
+        pair = glu.__dict__.pop("_shared_out", None) if early else None
+        shared, gate = pair if pair is not None else (b.shared_expert(x), b.shared_expert_gate(x))
+        if not (y.dtype == shared.dtype == gate.dtype == mx.bfloat16):
+            return (y * scores[..., None]).sum(axis=-2) + mx.sigmoid(gate) * shared
+        return route_cuda.tail(y, scores, shared, gate)
+
     def _shared(self, x):
         b = self.block
         return mx.sigmoid(b.shared_expert_gate(x)) * b.shared_expert(x)
 
-    def _mark_shared_early(self, x):
-        """MOE_SHARED_EARLY: hand the shared expert to this native pass (one row, or T under MOE_NATIVE_MTP), which builds it between its handshake and its wait (_call_native)."""
+    def _shared_pair(self, x):
+        b = self.block
+        return [b.shared_expert(x), b.shared_expert_gate(x)]
+
+    def _mark_shared_early(self, x, pair=False):
+        """MOE_SHARED_EARLY: hand the shared expert to this native pass (one row, or T under MOE_NATIVE_MTP), which builds it between its handshake and its wait (_call_native); `pair` hands it over unfinished, as [shared expert, its gate]."""
         if not (_SHARED_EARLY and _NATIVE is not None and _NATIVE.active and x.ndim == 3
                 and x.shape[0] == 1 and getattr(self.block, "shared_expert", None) is not None):
             return False
-        self.block.switch_mlp.__dict__["_shared_early"] = self._shared
+        self.block.switch_mlp.__dict__["_shared_early"] = self._shared_pair if pair else self._shared
         return True
 
     def _shared_out(self, x, early):
@@ -4435,26 +4564,44 @@ class StreamingSwitchGLU(nn.Module):
         other ring half meanwhile; every row goes through the same kernel on the same bytes as in its group."""
         k = n_rows // x.shape[0]
         half = (store.slots - store.pool) // 2
-        cuts = np.searchsorted(pos, np.arange(half, len(unique_ids), half))
-        bounds = [0, *cuts.tolist(), len(pos)]
         slot = self._slot_np[unique_ids]
         inq = (slot >= 0) & (slot < store.pool)
-        # A unit: its rows (indices into pos), its misses (indices into unique_ids, ascending), and a taken group's first index or None on the chain.
-        units, hit, cmiss = [], [], []
-        for gi, (r0, r1) in enumerate(zip(bounds, bounds[1:])):
-            a = gi * half
-            m = np.flatnonzero(~inq[a:a + half]) + a
-            if not _INPLACE or gguf_experts.dense_pays(len(np.unique(pos[r0:r1])), r1 - r0):
-                units.append((np.arange(r0, r1), m, a))
+        # A group: its rows (indices into pos) and its experts (indices into unique_ids, ascending), half of them a group.
+        lmr = self.__dict__.get("_lmr")
+        if lmr is None:
+            cuts = np.searchsorted(pos, np.arange(half, len(unique_ids), half))
+            bounds = [0, *cuts.tolist(), len(pos)]
+            groups = [(np.arange(r0, r1), np.arange(gi * half, min(gi * half + half, len(unique_ids))))
+                      for gi, (r0, r1) in enumerate(zip(bounds, bounds[1:]))]
+        else:
+            # MOE_RESIDENT_LM: each piece's rows grouped as the piece's own pass groups them, so a row takes the path (dense or chain) it takes there.
+            piece = np.searchsorted([a for a, _ in lmr], np.array(rows) // k, "right") - 1
+            groups = []
+            for c in range(len(lmr)):
+                sel = np.flatnonzero(piece == c)
+                uc = np.unique(pos[sel])
+                for i in range(0, len(uc), half):
+                    g = uc[i:i + half]
+                    groups.append((sel[(pos[sel] >= g[0]) & (pos[sel] <= g[-1])], g))
+        # A unit: its rows (indices into pos), its misses (indices into unique_ids, ascending), and a taken group's experts or None on the chain.
+        units, hit, cmiss, chain = [], [], [], []
+        for r, g in groups:
+            m = g[~inq[g]]
+            if not _INPLACE or gguf_experts.dense_pays(len(g), len(r)):
+                units.append((r, m, g))
             elif _ONECALL:
-                hit.append(np.arange(r0, r1)[inq[pos[r0:r1]]])
+                hit.append(r[inq[pos[r]]])
                 cmiss.append(m)
+                chain.append(r)
             else:
-                units.append((np.arange(r0, r1), m, None))
+                units.append((r, m, None))
         if cmiss:
-            hit, cmiss = np.concatenate(hit), np.concatenate(cmiss)
+            # Pieces share experts, so a miss is copied once for every piece's chain rows.
+            hit, cmiss = np.sort(np.concatenate(hit)), np.unique(np.concatenate(cmiss))
+            on = np.zeros(len(pos), bool)
+            on[np.concatenate(chain)] = True
             per = half if _OVERLAP else 2 * half
-            rounds = [(np.flatnonzero(np.isin(pos, cmiss[i:i + per])), cmiss[i:i + per], None)
+            rounds = [(np.flatnonzero(on & np.isin(pos, cmiss[i:i + per])), cmiss[i:i + per], None)
                       for i in range(0, len(cmiss), per)]
             # Under OVERLAP the quota rows are cut into as many pieces as there are rounds, so each round's copy runs under a piece.
             hits = [(h, cmiss[:0], None) for h in np.array_split(hit, max(1, len(rounds) if _OVERLAP else 1)) if len(h)]
@@ -4478,6 +4625,7 @@ class StreamingSwitchGLU(nn.Module):
         c0 = cut[-1]
         own = [tuple(b) for b in store.bufs]
         busy = [None, None]     # OVERLAP: per ring half, the output of the last launched unit that reads it
+        ys = []                 # MOE_RESIDENT_LM: each unit's (rows, output), scattered once at the end
 
         def fetch(i):
             m = units[i][1]
@@ -4493,8 +4641,8 @@ class StreamingSwitchGLU(nn.Module):
         for i, (r, m, a) in enumerate(units):
             dst, src0 = dst_all[cut[i]:cut[i + 1]], src_all[cut[i]:cut[i + 1]]
             if a is not None:
-                ids = unique_ids[a:a + half]
-                pg = pos[r] - a
+                ids = unique_ids[a]
+                pg = np.searchsorted(a, pos[r])
                 bufs, lo, _ = self._take_group(ids, store, ring=ring)
                 h = ids[pg] - lo if lo is not None else pg
                 y, reads = self._experts(src0, bufs, mx.array(h), False, h)[2], None
@@ -4502,17 +4650,24 @@ class StreamingSwitchGLU(nn.Module):
                 y = self._experts(src0, own, dev[c0:c0 + len(r)])[2]
                 c0 += len(r)
                 reads = base[i] // half if len(m) else None
-            out = _wide_out(out, n_rows, y)
-            out[dst] = y
+            if lmr is None:
+                out = _wide_out(out, n_rows, y)
+                out[dst] = y
+            else:
+                ys.append((dst, y))
             if _OVERLAP:
-                mx.async_eval(out)
+                mx.async_eval(out if lmr is None else y)
                 if reads is not None:
                     busy[reads] = y
                 if i + 1 < len(units):
                     ring = fetch(i + 1)
             elif i + 1 < len(units):
-                mx.eval(out)
+                mx.eval(out if lmr is None else y)
                 ring = fetch(i + 1)
+        if ys:
+            # MOE_RESIDENT_LM: one scatter of every unit's rows, since a copy of a run's whole output a unit held ~20 of them at once.
+            out = _wide_out(out, n_rows, ys[0][1])
+            out[mx.concatenate([d for d, _ in ys])] = mx.concatenate([v for _, v in ys])
         if reads is not None or any(b is not None for b in busy):
             # A unit that read ring rows is evaluated even when last, so no later copy lands under it.
             mx.eval(out)
@@ -4651,40 +4806,54 @@ class StreamingSwitchGLU(nn.Module):
         if nat.cuda:
             # MLX CUDA (native/moe_pipe_cuda): the signal kernel posts the router's ids and the wait kernel hands back the gather rows once the agent has claimed and copied them in.
             nv, ids = nat.nv, indices.astype(mx.uint32)
-            pre = None
-            if self._hits_first:
-                # MOE_PIPE_HITS_FIRST: the held experts' rows read before the post, so the claim cannot have touched them.
-                pre = nv.resident(ids, self._slot_of)
-                ids = mx.depends([ids], [pre])[0]
-            dep = tick = nv.signal(ids, self._native_idx)
-            deps = []
-            if self._guess_next is not None:
-                # MOE_PIPE_STAGING: the next layer's guess runs after this job's post, inside its park, and goes to the agent beside the job.
-                lg, k = self._guess_next(mx.depends([x], [tick])[0])
-                deps.append(nv.post_guess(tick, lg, k))
-            early = self.__dict__.pop("_shared_early", None)
-            if early is not None:
-                self.__dict__["_shared_out"] = sh = early(mx.depends([x], [tick])[0])
-                deps.append(sh)
-            bufs = [a[0] for a in _ARENAS[self._akey]]
-            if pre is not None:
-                # The held experts' chain inside the park, the missed ones' after the wait, and each slot's output taken from its own chain.
-                yh = exl3_experts.experts(mx.expand_dims(mx.depends([x], [tick])[0], (-2, -3)), bufs, pre, self._exl3,
-                                          skip=True)
-                deps.append(yh)
-            if deps:
-                dep = mx.depends([tick], deps)[0]
-            rhs = nv.wait_rows(dep, ids, self._slot_of)
-            if pre is None:
-                y = self._experts(mx.expand_dims(x, (-2, -3)), bufs, rhs)[2].squeeze(-2)
+            if _PIPE_ONE and not self._hits_first and ids.size <= 32:
+                # MOE_PIPE_ONE: post, guess and wait in one kernel, which hands out the rows at once when the table holds every id (moe_pipe_cuda.sync_rows).
+                lg, k = self._guess_next(x) if self._guess_next is not None else (None, 0)
+                early = self.__dict__.pop("_shared_early", None)
+                if early is not None:
+                    self.__dict__["_shared_out"] = early(x)
+                rhs = nv.sync_rows(ids, self._native_idx, self._slot_of, lg, k)
+                y = self._experts(mx.expand_dims(x, (-2, -3)), [a[0] for a in _ARENAS[self._akey]], rhs)[2].squeeze(-2)
             else:
-                held = pre != _HITS_SKIP
-                ym = exl3_experts.experts(mx.expand_dims(x, (-2, -3)), bufs, mx.where(held, _HITS_SKIP, rhs),
-                                          self._exl3, skip=True)
-                y = mx.where(held[..., None, None], yh, ym).squeeze(-2)
+                pre = None
+                if self._hits_first:
+                    # MOE_PIPE_HITS_FIRST: the held experts' rows read before the post, so the claim cannot have touched them.
+                    pre = nv.resident(ids, self._slot_of)
+                    ids = mx.depends([ids], [pre])[0]
+                dep = tick = nv.signal(ids, self._native_idx)
+                deps = []
+                if self._guess_next is not None:
+                    # MOE_PIPE_STAGING: the next layer's guess runs after this job's post, inside its park, and goes to the agent beside the job.
+                    lg, k = self._guess_next(mx.depends([x], [tick])[0])
+                    deps.append(nv.post_guess(tick, lg, k))
+                early = self.__dict__.pop("_shared_early", None)
+                if early is not None:
+                    self.__dict__["_shared_out"] = sh = early(mx.depends([x], [tick])[0])
+                    deps += sh if isinstance(sh, list) else [sh]
+                bufs = [a[0] for a in _ARENAS[self._akey]]
+                if pre is not None:
+                    # The held experts' chain inside the park, the missed ones' after the wait, and each slot's output taken from its own chain.
+                    yh = exl3_experts.experts(mx.expand_dims(mx.depends([x], [tick])[0], (-2, -3)), bufs, pre, self._exl3,
+                                              skip=True)
+                    deps.append(yh)
+                if deps:
+                    dep = mx.depends([tick], deps)[0]
+                rhs = nv.wait_rows(dep, ids, self._slot_of)
+                if pre is None:
+                    y = self._experts(mx.expand_dims(x, (-2, -3)), bufs, rhs)[2].squeeze(-2)
+                else:
+                    held = pre != _HITS_SKIP
+                    ym = exl3_experts.experts(mx.expand_dims(x, (-2, -3)), bufs, mx.where(held, _HITS_SKIP, rhs),
+                                              self._exl3, skip=True)
+                    y = mx.where(held[..., None, None], yh, ym).squeeze(-2)
+            nat.unsent += 1
+            if nat.unsent < _eval_every() and self._native_idx < len(nat.glus) - 1:
+                return y        # MOE_CUDA_EVAL_EVERY: the next layers' async_eval takes this one along
             t = time.perf_counter()
             mx.async_eval(y)
-            nv.committed()
+            for _ in range(nat.unsent):
+                nv.committed()
+            nat.unsent = 0
             t = time.perf_counter() - t
             if t > 1e-3:
                 nat.holds += 1
@@ -6016,6 +6185,10 @@ def _stage_guess(mlp, k):
 def _pipe_guess(gate, k):
     """MOE_PIPE_STAGING's guess of a layer's experts from the layer below's MoE input: its gate's f32 logits, as the block's own router takes them, and its top-k."""
     def guess(x):
+        if _GUESS_BF16 and x.dtype == mx.bfloat16:
+            lg = gate(x)
+            if lg.dtype in (mx.float32, mx.bfloat16):
+                return lg, k
         lg = gate(x.astype(mx.float32))
         return (lg if lg.dtype == mx.float32 else lg.astype(mx.float32)), k
     return guess
@@ -7043,12 +7216,12 @@ def _lm_start(layer, glu, args):
             _LM_PLE.append(streamer)
 
 
-def _lm_layer_call(layer, args, kwargs):
-    """One layer of a layer-major prefill pass (see LM_W above): dense part and routing chunk by chunk, the experts once over every row of the pass and then each chunk's combine with its rows, the block running its own code both times."""
+def _lm_layer_call(layer, args, kwargs, lmr=None):
+    """One layer of a layer-major prefill pass (see LM_W above): dense part and routing chunk by chunk, the experts once over every row of the pass and then each chunk's combine with its rows, the block running its own code both times; `lmr` (MOE_RESIDENT_LM) gives the chunks, the pieces of the plan, over the resident store."""
     T, pre, moe_in, moe_out, caches = _lm_parts(layer, args, kwargs)
     glu, mlp = _glu_of(layer), _moe_of(layer)
     rp = _LMRP
-    if not _LM_READ:
+    if lmr is None and not _LM_READ:
         if rp["win"]:
             rp["prev"] = (rp["T"], sum(rp["win"]) / len(rp["win"]))
         if rp["pre"]:
@@ -7059,7 +7232,7 @@ def _lm_layer_call(layer, args, kwargs):
     rp["t0"] = t0
     # The width the budget planned this pass at (MemBudget.plan), LM_W unless the keys left no room for a chunk that wide.
     w = getattr(_MEASURING, "lm_w", LM_W) if _MEASURING is not None else LM_W
-    bounds = [(a, min(a + w, T)) for a in range(0, T, w)]
+    bounds = lmr or [(a, min(a + w, T)) for a in range(0, T, w)]
     xs, keeps, inds = [], [], []
 
     def capture(x, idx):
@@ -7085,7 +7258,12 @@ def _lm_layer_call(layer, args, kwargs):
         ane_split.ACTIVE = False
         glu.__dict__.pop("_lm", None)
     cat = (lambda v: v[0] if len(v) == 1 else mx.concatenate(v, axis=1))
-    y = glu(cat(xs), cat(inds))
+    if lmr is not None:
+        glu.__dict__["_lmr"] = lmr      # _call_resident groups each piece's rows as the piece's own pass does
+    try:
+        y = glu(cat(xs), cat(inds))
+    finally:
+        glu.__dict__.pop("_lmr", None)
     mx.eval(y)
     del inds
     out = None
@@ -7107,11 +7285,35 @@ def _lm_layer_call(layer, args, kwargs):
         if i == 0:
             _MEASURING.lm_rows()
     # The window a read ahead hides behind (_lm_whole): this layer's time outside its waits for reads, with the process's first left out (_lm_count).
-    if _lm_count("win") > 1:
+    if lmr is None and _lm_count("win") > 1:
         rp["win"].append(time.perf_counter() - t0 - (TIMERS["lm_wait"] - w0))
     if layer.__dict__.get("_prefill_last"):
         _lm_close()
     return out
+
+
+def _lmr_pieces(bud, w):
+    """MOE_RESIDENT_LM: how many pieces of `w` positions a run takes, up to _LMR_K: as many as the device's free memory
+    holds at the growth a position of a run was measured at (lmr_pos), or a token-major piece's (rate) until then."""
+    per = (bud.lmr_pos or bud.rate) * w
+    free = mx.device_info()["free_memory"] + mx.get_cache_memory()
+    k = max(1, min(_LMR_K, int(free // per))) if per > 0 else 1
+    if _RESIDENT_LOG:
+        print(f"  resident run: {k} pieces of {w}, {free / 1e9:.2f} GB free, {per / w / 1e3:.0f} KB a position "
+              f"({'measured' if bud.lmr_pos else 'rate'})", flush=True)
+    return k
+
+
+def _lmr_supported(model, glus):
+    """MOE_RESIDENT_LM: every layer of the stack cut at its MoE block by _lm_parts (Qwen3-Next/3.6's halves) and every
+    expert layer a GGUF pack's (_call_resident), the layers marked for _prefill_layer_call."""
+    stack = _layer_stack_of(model)
+    layers = stack["layers"] if stack is not None else []
+    ok = (bool(layers) and all(_lm_family(l) == "half" and l.__dict__.get("_prefill_on") for l in layers)
+          and all(g._gguf is not None for g in glus))
+    for l in layers if ok else ():
+        l.__dict__["_lmr_on"] = True
+    return ok
 
 
 def lm_supported(model):
@@ -7134,6 +7336,8 @@ def _prefill_layer_call(orig, layer, args, kwargs):
     """One decoder layer of a prefill pass, its lazy tails forced before the next layer is built, so a lazy slice of a long input is taken inside the layer and the MoE tail does not coexist with the next layer's attention."""
     global _IN_PREFILL, _PREFILL_AT
     bud = _MEASURING
+    if _LMR_BOUNDS is not None and layer.__dict__.get("_lmr_on"):
+        return _lm_layer_call(layer, args, kwargs, _LMR_BOUNDS)
     if bud is not None and bud.lm_pass and layer.__dict__.get("_lm_on"):
         return _lm_layer_call(layer, args, kwargs)
     if PREFILL_STOP is not None:

@@ -130,7 +130,8 @@ if not (_WAIT_S > 0 and _BEAT_MS >= 0):
 # Arrays made once and kept: never a fresh host array a call (a freed one can be a device-wide cudaFree).
 _ADDR = mx.array([_lib.mpc_block_dev()], dtype=mx.uint64)
 _BOUND = mx.array([int(_WAIT_S * 1e9), int(_BEAT_MS * 1e6)], dtype=mx.uint64)
-_CTR = mx.array(np.full(4, int(_blk[POSTED]), dtype=np.uint32))     # the job counter: only the GPU moves it
+# The job counter (word 0), only the GPU moves it; word 1 counts MOE_PIPE_ONE's blocks out of a kernel.
+_CTR = mx.array(np.array([int(_blk[POSTED]), 0, 0, 0], dtype=np.uint32))
 # The wait's device words: job, state, records republished, heartbeat (MOE_PIPE_PIECES: pieces republished at 128 on).
 _SCR = mx.zeros((128 + 1024 if _PIECES else 72,), dtype=mx.uint32)
 mx.eval(_ADDR, _BOUND, _CTR, _SCR)
@@ -467,6 +468,176 @@ _GUESS = r"""
   }
 """
 
+# MOE_PIPE_ONE: signal, post_guess and wait_rows (pieces mode) as one kernel a layer. Every block reads the job number v = ctr[0] + 1
+# at its start and the last block to leave raises ctr[0] to v (ctr[1] counts the blocks out), since the next layer's kernel starts only
+# after this one has ended. Block 0's first warp reads table[ids] first: when every id is held, the agent's claim of the job will move
+# no slot (a hit keeps its slot, claim() / claim_store()), so the job is posted and the rows go out without waiting for the claim; the
+# agent still claims every job in order, so the LRU, the quota rows, the ring, the tier and the logs see the same jobs as before. To
+# keep the job and guess rings (8 entries) from being overrun, a job is posted only once the agent has answered job v - LAG. A job
+# with a miss waits as wait_rows does.
+_ONE_HEAD = r"""
+  const unsigned* P = reinterpret_cast<const unsigned*>(blk[0]);
+  unsigned* D = const_cast<unsigned*>(scr);
+  unsigned* C = const_cast<unsigned*>(ctr);
+  const unsigned v = C[0] + 1;
+  const unsigned long long t0 = mpc_gt(), b = bound[0], hb = bound[1];
+  unsigned long long tc = 0, tf = 0;
+  __shared__ unsigned all_s;
+  __shared__ int held[32];
+  if (blockIdx.x == 0) {
+    if (threadIdx.x < 32) {
+      const unsigned lane = threadIdx.x;
+      int s = 0;
+      if (lane < NK) s = reinterpret_cast<const volatile int*>(tab)[ids[lane]];
+      held[lane] = s;
+      const bool all = __all_sync(0xffffffffu, lane >= NK || s >= 0);
+      unsigned gp[GK > 0 ? GK : 1];
+      /*G*/if (GK > 0) {
+        // _GUESS's picks: the GK largest of GNE logits, a tie to the larger index
+        float g[GNPL];
+        for (int i = 0; i < GNPL; ++i) {
+          const int e = lane + 32 * i;
+          g[i] = e < GNE ? static_cast<float>(lg[e]) : -INFINITY;
+        }
+        for (int j = 0; j < GK; ++j) {
+          float bv = -INFINITY;
+          int bi = -1;
+          for (int i = 0; i < GNPL; ++i) {
+            if (g[i] >= bv) { bv = g[i]; bi = lane + 32 * i; }
+          }
+          for (int m = 16; m > 0; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, m);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, m);
+            if (ov > bv || (ov == bv && oi > bi)) { bv = ov; bi = oi; }
+          }
+          gp[j] = static_cast<unsigned>(bi);
+          for (int i = 0; i < GNPL; ++i) {
+            if (lane + 32 * i == bi) g[i] = -INFINITY;
+          }
+        }
+      }/*G*/
+      unsigned go = 1;
+      if (lane == 0) {
+        // `done` as last read (scr[70], it only grows) spares the host read while it is recent enough
+        volatile unsigned* VD = D;
+        if (v > LAG && VD[70] + LAG < v) {
+          go = mpc_spin(P, P + 1, v - LAG, t0, b, hb, 0u);
+          VD[70] = mpc_ld(P + 1);
+        }
+        unsigned* Pw = const_cast<unsigned*>(P);
+        unsigned* e = Pw + 64 + 128 * (v % 8);
+        unsigned* G = Pw + 7168 + 32 * (v % 8);
+        for (int j = 0; j < NK; ++j) e[3 + j] = static_cast<unsigned>(ids[j]);
+        e[1] = static_cast<unsigned>(lay[0]);
+        e[2] = NK;
+        if (LOG) {
+          e[126] = static_cast<unsigned>(t0);
+          e[127] = static_cast<unsigned>(t0 >> 32);
+        }
+        if (GK > 0) {
+          for (int j = 0; j < GK; ++j) G[2 + j] = gp[j];
+          G[1] = GK;
+        }
+        // the entries, then their job words, then `posted`: the agent reads them in that order
+        __threadfence_system();
+        reinterpret_cast<volatile unsigned*>(e)[0] = v;
+        if (GK > 0) reinterpret_cast<volatile unsigned*>(G)[0] = v;
+        __threadfence_system();
+        reinterpret_cast<volatile unsigned*>(Pw)[0] = v;
+        all_s = (all || !go) ? 1u : 0u;
+        if (all_s) {
+          // no claim to wait for: the copy blocks leave at once
+          D[1] = 2u;
+          __threadfence();
+          reinterpret_cast<volatile unsigned*>(D)[0] = v;
+        }
+      }
+      if (!__shfl_sync(0xffffffffu, all_s, 0)) {
+"""
+# then _WAIT_LEAD's warp-0 body (from `unsigned ok = 0` to its records loop), closed below
+_ONE_MID = r"""
+      }
+    }
+    __syncthreads();
+    if (LOG && threadIdx.x == 0) {
+      volatile unsigned long long* L =
+          reinterpret_cast<volatile unsigned long long*>(const_cast<unsigned*>(P) + 2048) + 8 * (v % 128);
+      L[1] = t0;
+      L[2] = t0;
+      L[3] = mpc_gt();
+      L[4] = tc;
+      L[5] = 0;
+      L[6] = tf;
+      L[7] = all_s;
+      L[0] = v;
+    }
+    if (threadIdx.x < NK) {
+      int s = held[threadIdx.x];
+      if (!all_s) s = reinterpret_cast<const volatile int*>(tab)[ids[threadIdx.x]];
+      rhs[threadIdx.x] = s < 0 ? 0u : static_cast<unsigned>(s);
+    }
+  } else do {
+"""
+# then _WAIT_P's copy part with its `return` as `break`, then every block leaves through the counter
+_ONE_TAIL = r"""
+  } while (0);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    if (atomicAdd(C + 1, 1u) == gridDim.x - 1) {
+      C[1] = 0u;
+      __threadfence();
+      reinterpret_cast<volatile unsigned*>(C)[0] = v;
+    }
+  }
+"""
+LAG = 4
+
+
+def _one_src(guess):
+    """The kernel's source, without the guess's lines when it takes no logits."""
+    head = _ONE_HEAD
+    if not guess:
+        a, z = head.index("/*G*/"), head.rindex("/*G*/")
+        head = head[:a] + head[z + 5:]
+    lead = _WAIT_LEAD.replace("D)[2 + r] = v;", "D)[128 + r] = v;")
+    a, z = lead.index("      unsigned ok = 0, nrec = 0;"), lead.index("    __syncthreads();\n    if (LOG")
+    body = lead[a:z].rstrip()
+    assert body.endswith("}\n    }"), body[-40:]
+    body = body[:body.rindex("}")]          # the leader's `if (threadIdx.x < 32) {` closes in _ONE_MID
+    copy = _WAIT_P[len(lead):]
+    assert _WAIT_P.startswith(lead) and copy.count("if (!go) return;") == 1
+    return head + body + _ONE_MID + copy.replace("if (!go) return;", "if (!go) break;") + _ONE_TAIL
+
+
+def _lay(layer):
+    lay = _LAY.get(layer)
+    if lay is None:
+        lay = _LAY[layer] = mx.array([layer], dtype=mx.int32)
+        mx.eval(lay)
+    return lay
+
+
+def sync_rows(ids, layer, table, lg=None, k=0):
+    """MOE_PIPE_ONE: signal(ids, layer), post_guess(tick, lg, k) when lg is given and wait_rows(tick, ids, table) in one
+    kernel; a job whose ids the table all holds does not wait for its claim. -> the gather rows (uint32, ids' shape)."""
+    assert ids.size <= 32 and _PIECES
+    guess = lg is not None
+    if guess:
+        assert k <= 30 and lg.shape[-1] <= 1024 and lg.dtype in (mx.float32, mx.bfloat16)
+    ne = lg.shape[-1] if guess else 32
+    name = "mpc_one_g" if guess else "mpc_one"
+    ins = ["ids", "lay", "ctr", "blk", "tab", "bound", "scr"] + (["lg"] if guess else [])
+    if name not in _kern:
+        _kern[name] = mx.fast.cuda_kernel(name=name, input_names=ins, output_names=["rhs"], source=_one_src(guess),
+                                          header=_HDR)
+    arrs = [ids, _lay(layer), _CTR, _ADDR, table, _BOUND, _SCR] + ([lg] if guess else [])
+    return _kern[name](
+        inputs=arrs, template=[("NK", ids.size), ("LOG", _LOG), ("SL", _SLICES), ("GK", k if guess else 0),
+                               ("GNE", ne), ("GNPL", (ne + 31) // 32), ("LAG", LAG)],
+        grid=(256 * BLOCKS, 1, 1), threadgroup=(256, 1, 1), output_shapes=[ids.shape], output_dtypes=[mx.uint32])[0]
+
+
 # MOE_PIPE_HITS_FIRST: the slot of each id from the table as it stands before the job is posted (volatile loads, as the wait's
 # rows), 0xFFFFFFFF for an id not held; the claim keeps a held id's slot, so these rows are the wait's rows for the hits.
 _RES = r"""
@@ -489,12 +660,8 @@ def _kernel(name, src, ins, outs):
 
 def signal(ids, layer):
     """Post job (layer, ids) for the agent once the GPU gets here; -> the job number, a (1,) uint32 array."""
-    lay = _LAY.get(layer)
-    if lay is None:
-        lay = _LAY[layer] = mx.array([layer], dtype=mx.int32)
-        mx.eval(lay)
     return _kernel("mpc_signal", _SIG, ["ids", "lay", "ctr", "blk"], ["tick"])(
-        inputs=[ids, lay, _CTR, _ADDR], template=[("NK", ids.size), ("LOG", _LOG)], grid=(1, 1, 1),
+        inputs=[ids, _lay(layer), _CTR, _ADDR], template=[("NK", ids.size), ("LOG", _LOG)], grid=(1, 1, 1),
         threadgroup=(1, 1, 1), output_shapes=[(1,)], output_dtypes=[mx.uint32])[0]
 
 
@@ -526,7 +693,7 @@ def post_guess(tick, lg, k):
     """The top k of the next layer's gate logits `lg` (E of them, f32) written beside job `tick` for the agent's staging;
     -> a (1,) uint32 array the wait must depend on, so the kernel runs between the job's post and its wait."""
     ne = lg.shape[-1]
-    assert k <= 30 and ne <= 1024 and lg.dtype == mx.float32
+    assert k <= 30 and ne <= 1024 and lg.dtype in (mx.float32, mx.bfloat16)
     return _kernel("mpc_guess", _GUESS, ["tick", "lg", "blk"], ["tock"])(
         inputs=[tick, lg, _ADDR], template=[("NE", ne), ("KT", k), ("NPL", (ne + 31) // 32)], grid=(32, 1, 1),
         threadgroup=(32, 1, 1), output_shapes=[(1,)], output_dtypes=[mx.uint32])[0]
@@ -568,17 +735,35 @@ def warm_resident(k):
     _warm.add(("res", k))
 
 
-def warm_guess(ne, k):
+def warm_guess(ne, k, dtype=mx.float32):
     """post_guess for ne logits and k picks compiled and run once before any agent exists, as warm(); it writes entry 0
     with job 0, which no agent ever takes."""
-    if (ne, k) in _warm:
+    if (ne, k, dtype) in _warm:
         return
     if Agent.live:
         raise RuntimeError("moe_pipe_cuda.warm_guess: an agent is live")
-    tick, lg = mx.zeros((1,), dtype=mx.uint32), mx.zeros((1, 1, ne), dtype=mx.float32)
+    tick, lg = mx.zeros((1,), dtype=mx.uint32), mx.zeros((1, 1, ne), dtype=dtype)
     mx.eval(tick, lg)
     mx.eval(post_guess(tick, lg, k))
-    _warm.add((ne, k))
+    _warm.add((ne, k, dtype))
+
+
+def warm_one(k, ne=0, dtype=mx.float32):
+    """sync_rows for k ids (and a guess of k of ne logits when ne) compiled and run once before any agent exists, as
+    warm(): `done` is raised ahead and the table holds every id, so the job answers itself."""
+    key = ("one", k, ne, dtype)
+    if key in _warm:
+        return
+    if Agent.live:
+        raise RuntimeError("moe_pipe_cuda.warm_one: an agent is live")
+    _blk[DONE] = _blk[CLAIMED] = max(int(_blk[DONE]), int(_blk[POSTED]) + 1)
+    ids = mx.zeros((1, 1, k), dtype=mx.uint32)
+    tab = mx.zeros((max(k, 1),), dtype=mx.int32)
+    lg = mx.zeros((1, 1, ne), dtype=dtype) if ne else None
+    mx.eval(ids, tab, *([lg] if ne else []))
+    mx.eval(sync_rows(ids, 0, tab, lg, k))
+    _blk[SENT] = _blk[POSTED]
+    _warm.add(key)
 
 
 def beat_gaps():
