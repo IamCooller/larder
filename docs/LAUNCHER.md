@@ -233,7 +233,7 @@ Tested models (`launch.CURATED`, each pinned to a Hugging Face commit):
 
 | id | model | source | settings |
 |---|---|---|---|
-| `qwen3.6-35b` | Qwen3.6-35B-A3B, 256 experts x 40 layers | `mlx-community/Qwen3.6-35B-A3B-4bit` | Apple: the adaptive expert arena, `--prefill-step 0 --keep-convs 4`, cache bias 0.5 |
+| `qwen3.6-35b` | Qwen3.6-35B-A3B, 256 experts x 40 layers | `mlx-community/Qwen3.6-35B-A3B-4bit` | Apple: the adaptive expert arena, `--prefill-step 0 --keep-convs 4`, cache bias 0.5. CUDA: id `qwen3.6-35b-q40`, the published trunk + Q4_0 GGUF experts repacked + the model's MTP head, cache bias 0.5 at budget 0.2 (the 4-bit pack stays a variant) |
 | `flash-next-exl3` | Qwen3.8-Flash-Next, 512 experts x 48 layers, 3-bit EXL3 experts | `mlx-community/Qwen3.8-Flash-Next-4bit` (dense part) + `beamster/Qwen3.8-Flash-Next-Sushi-3bpw` (experts) | `--mem-peak-gb` / `--mem-peak-max-gb`, cache bias 0.5, the native reader |
 | `qwen1.5-moe` | Qwen1.5-MoE-A2.7B-Chat, small | `mlx-community/Qwen1.5-MoE-A2.7B-Chat-4bit` | `--mem-peak-gb`, exact routing |
 | `qwen3-8b`, `qwen3-4b` | dense Qwen3 | `mlx-community/Qwen3-8B-4bit`, `-4B-4bit` | resident, a draft model if one is on disk |
