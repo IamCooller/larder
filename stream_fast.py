@@ -140,13 +140,31 @@ def _backend():
 BACKEND = _backend()
 _LINUX = sys.platform.startswith("linux")
 
+# MOE_CUDA_ROWS=N (CUDA native passes under MOE_PIPE_ONE; HEAD_ROWS with a head on the resident path, else off; 0 or 1 off): a pass of 2 to N positions whose N x top_k ids fit one job (32) goes through the agent too, a speculative verify pass among them, with each row's bits those of a one-row pass at cache bias 0.
+_CUDA_ROWS = max(1, int(os.environ.get("MOE_CUDA_ROWS", "1") or 1)) if BACKEND == "cuda" else 1
+HEAD_ROWS = 2       # a gamma-1 head's verify pass; 4 ran 0.11 ms a token slower on a head server
+# MOE_CUDA_ROWS_RUNS=1 (with MOE_CUDA_ROWS, off by default: a head server's short turns ran 6.19 ms a token on the chain against 6.39 on the runs): a GGUF pack's experts of a T-row pass sorted by slot through the run kernels, so each slot's weights are read once for every row that wants it (gguf_experts' runs, bit-equal to the chain).
+_ROWS_RUNS = os.environ.get("MOE_CUDA_ROWS_RUNS", "0") == "1"
+# MOE_CUDA_ROWS_EVAL_EVERY=N (with MOE_CUDA_ROWS, 4 by default, 0 MOE_CUDA_EVAL_EVERY's): a T-row pass, which is synced, hands N MoE layers to the GPU a time (T=2: 10.4 ms at 4, 11.0 at 8, 11.1 at 2).
+_ROWS_EVAL = int(os.environ.get("MOE_CUDA_ROWS_EVAL_EVERY", "4"))
+# MOE_SPEC_AHEAD=N (with MOE_CUDA_ROWS; 1 with a head on the resident path, else off; 0 off): a greedy speculative round's next round is built while the GPU finishes it, as if every draft stands; each hand-off of that build looks for the verdict in the mapped block (moe_pipe_cuda.verdict) and the N-th waits for it (spec.Speculator.ahead).
+_SPEC_AHEAD = int(os.environ.get("MOE_SPEC_AHEAD", "0") or 0) if BACKEND == "cuda" else 0
+_HANDOFF = None     # MOE_SPEC_AHEAD: called after each hand-off of a native pass while spec builds a round ahead
+
+
+def _watch(fn):
+    global _HANDOFF
+    _HANDOFF = fn
+
 # MOE_CUDA_GDN (on by default under CUDA, never on Metal or CPU): mlx_lm's GatedDeltaNet recurrence as a CUDA kernel instead of a per-position ops loop (gdn_cuda.py, imported only when on).
 if BACKEND == "cuda" and os.environ.get("MOE_CUDA_GDN", "1") == "1":
     import gdn_cuda
     gdn_cuda.install()
     # MOE_CUDA_GDN_GLUE (on under MOE_RESIDENT unless =0, =1 elsewhere): qwen3_5's GatedDeltaNet decode row in two kernels around the recurrence (gdn_cuda.install_glue).
     if os.environ.get("MOE_CUDA_GDN_GLUE", "1" if os.environ.get("MOE_RESIDENT") == "1" else "0") == "1":
-        gdn_cuda.install_glue()
+        gdn_cuda.install_glue(_CUDA_ROWS)
+        import mlx_lm.models.qwen3_5 as _q35
+        _q35.GatedDeltaNet._glue_rows = _CUDA_ROWS
 
 # MOE_CPU_KERNELS (on by default on MLX's CPU device, never on Metal or CUDA): cpu_ext's threaded AVX-512 kernels for the quantized matmuls, the expert gather, attention and the GatedDeltaNet scan (cpu_kernels.py).
 if BACKEND == "cpu" and os.environ.get("MOE_CPU_KERNELS", "1") == "1":
@@ -157,8 +175,58 @@ if BACKEND == "cpu" and os.environ.get("MOE_CPU_KERNELS", "1") == "1":
 _CUDA_SLOTS = BACKEND == "cuda" and os.environ.get("MOE_CUDA_SLOTS", "1") == "1"
 # MOE_CUDA_COMBINE (CUDA only, on unless =0): mlx_lm's probability-routed MoE block's decode row as two kernels, router and combine (route_cuda.install_tail).
 _CUDA_COMBINE = BACKEND == "cuda" and os.environ.get("MOE_CUDA_COMBINE", "1") == "1"
-if _CUDA_SLOTS or _CUDA_COMBINE:
+if _CUDA_SLOTS or _CUDA_COMBINE or _CUDA_ROWS > 1:
     import route_cuda
+    route_cuda.ROWS = _CUDA_ROWS
+_QL_CALL = nn.QuantizedLinear.__call__
+_ROPE_CALL = nn.RoPE.__call__
+
+
+def _install_rows():
+    """MOE_CUDA_ROWS > 1: the 4-bit matmuls and RoPE of 2 to N rows with a one-row call's bits, and the GatedDeltaNet glue for N rows."""
+    global route_cuda
+    import route_cuda
+    route_cuda.ROWS = _CUDA_ROWS
+    gl = sys.modules.get("gdn_cuda")
+    if gl is not None:
+        import mlx_lm.models.qwen3_5 as q35
+        cls = q35.GatedDeltaNet
+        if getattr(cls, "_gdn_glue", False) and getattr(cls, "_glue_rows", 1) < _CUDA_ROWS:
+            # The glue installed at import for one row, again for N.
+            cls.__call__, cls._gdn_glue = cls._gdn_glue_orig, False
+            gl.install_glue(_CUDA_ROWS)
+            cls._glue_rows = _CUDA_ROWS
+    if getattr(nn.QuantizedLinear.__call__, "_rows", False):
+        return
+
+    def _rows_linear(self, x):
+        """MOE_CUDA_ROWS: a 4-bit layer on 2 to N rows reads its weights once (route_cuda.qmv_rows), each row the bits of MLX's one-row matmul."""
+        t = x.size // x.shape[-1]
+        if 1 < t <= _CUDA_ROWS and x.dtype == mx.bfloat16:
+            ok = self.__dict__.get("_rows_ok")      # the layer's own part of qmv_fits, decided once
+            if ok is None:
+                ok = self.__dict__["_rows_ok"] = route_cuda.qmv_fits(x, self["weight"], self["scales"], self.group_size,
+                                                                     self.bits, self.mode, self.get("biases"))
+            if ok:
+                y = route_cuda.qmv_rows(x, self["weight"], self["scales"], self["biases"], self.group_size)
+                return y + self["bias"] if "bias" in self else y
+        return _QL_CALL(self, x)
+    _rows_linear._rows = True
+    nn.QuantizedLinear.__call__ = _rows_linear
+
+    def _rows_rope(self, x, offset=0):
+        """MOE_CUDA_ROWS: a native pass's T positions roped as MLX's one-position kernel ropes a decode row, since its kernel for several positions now and then rounds otherwise."""
+        t = x.shape[-2] if x.ndim >= 2 else 1
+        if 1 < t <= _CUDA_ROWS and _NATIVE is not None and _NATIVE.active:
+            if x.ndim == 4 and x.shape[0] == 1 and not self.traditional:
+                return route_cuda.rope_rows(x, self.dims, self.base, self.scale, offset)     # one launch, the same bits
+            return mx.concatenate([_ROPE_CALL(self, x[..., i:i + 1, :], offset=offset + i) for i in range(t)], axis=-2)
+        return _ROPE_CALL(self, x, offset)
+    nn.RoPE.__call__ = _rows_rope
+
+
+if _CUDA_ROWS > 1:
+    _install_rows()
 
 # MOE_RESIDENT=1 (CUDA under a budget store, off by default; the launcher sets it where the experts fit VRAM + RAM): the store lives in device memory, is filled at load with the native agent's tier holding the rest, and a prefill reads its experts from both instead of emptying the store.
 _RESIDENT = _RESIDENT_ASKED = BACKEND == "cuda" and os.environ.get("MOE_RESIDENT") == "1"
@@ -316,6 +384,7 @@ _FOOT_TOP = [0]
 _VRAM_OWN = False
 _NVML = None            # (library, device handle) once loaded, False where NVML is missing
 _OTHERS = [0]           # the last good reading of vram_others
+_OTHERS_AT = [0.0]      # when it was read (MOE_CUDA_ROWS)
 
 
 class _NvProc(ctypes.Structure):
@@ -338,6 +407,10 @@ def vram_others():
             pass
     if not _NVML:
         return None
+    if _CUDA_ROWS > 1 and time.perf_counter() - _OTHERS_AT[0] < 0.05:
+        # MOE_CUDA_ROWS: a reading 50 ms old stands, as a synced verify pass's start pays the 2-3 a pass makes (~0.3 ms)
+        return _OTHERS[0]
+    _OTHERS_AT[0] = time.perf_counter()
     nv, h = _NVML
     # GPU 0 by NVML's index, which ignores CUDA_VISIBLE_DEVICES; a multi-GPU machine needs the device's UUID.
     used, me = {}, os.getpid()
@@ -1635,7 +1708,8 @@ class MemBudget:
         if _KV_HOST:
             kv_host.drop_live()
         # MOE_CUDA_TOKEN_AHEAD: a decode pass after a native one holds the caches that pass left, not a lazy front, so it does not wait for them.
-        if not (n == 1 and not fresh and _NATIVE is not None and _NATIVE.owner == "agent" and _token_ahead()):
+        if not ((n == 1 or _ROWS_VERIFY) and not fresh and _NATIVE is not None and _NATIVE.owner == "agent"
+                and _token_ahead()):
             _eval_caches(caches)
         self._ticks += 1
         after = self.prefill
@@ -2451,6 +2525,43 @@ _NATIVE_ROWS = os.environ.get("MOE_NATIVE_MTP", "0") == "1"
 _NATIVE_MISSING_SAID = False
 
 
+_ROWS_VERIFY = False     # MOE_CUDA_ROWS: True while a speculative round's verify pass is built, the only wide pass that goes native
+
+
+def _verify_pass(taped):
+    """spec.Speculator._taped with _ROWS_VERIFY set around it, so a prompt's short tail keeps main's path and bits."""
+    def _taped(self, inp, cache, gdn):
+        global _ROWS_VERIFY
+        _ROWS_VERIFY = True
+        try:
+            return taped(self, inp, cache, gdn)
+        finally:
+            _ROWS_VERIFY = False
+    _taped._rows = True
+    return _taped
+
+
+def _rows_sdpa(model):
+    """MOE_CUDA_ROWS: a native pass's causal attention over T new rows as T one-row calls over the keys each row's own pass sees, since MLX's T-query path sums a row in another order than its one-query path."""
+    for m in model.modules():
+        mod = sys.modules.get(type(m).__module__)
+        inner = getattr(mod, "scaled_dot_product_attention", None)
+        if inner is None or getattr(inner, "_rows", False):
+            continue
+
+        def sdpa(queries, keys, values, cache, scale, mask, sinks=None, inner=inner):
+            t = queries.shape[2]
+            if 1 < t <= _CUDA_ROWS and _NATIVE is not None and _NATIVE.active and isinstance(mask, str) and mask == "causal":
+                n = keys.shape[2] - t
+                return mx.concatenate([inner(queries[:, :, i:i + 1], keys[:, :, :n + i + 1], values[:, :, :n + i + 1],
+                                             cache=cache, scale=scale, mask=None, sinks=sinks) for i in range(t)], axis=2)
+            return inner(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
+        sdpa._rows = True
+        if hasattr(inner, "chunkattn"):
+            sdpa.chunkattn = True       # chunkattn's own marker: it does not wrap this again
+        mod.scaled_dot_product_attention = sdpa
+
+
 def native_default(defer=False, arena=True):
     """True when a run on the adaptive arena (no --mem-peak-gb) on Metal takes the native agent and its T-row MTP verify without MOE_NATIVE set, as the launcher's arena recipe does, else None: an explicit MOE_NATIVE or MOE_NATIVE_MTP wins, and a missing or stale moe_native or a path install() refuses beside it keeps Python."""
     global _NATIVE_ROWS, _NATIVE_MISSING_SAID
@@ -2485,14 +2596,38 @@ class _Native:
         # CUDA: the handshake kernels run once before the agent exists, and the first decode pass after install runs on the Python path, so no kernel loads for the first time while a wait is pending.
         self.cuda = BACKEND == "cuda"
         self.warm, self.holds, self.hold_s = not self.cuda, 0, 0.0
-        global _PIPE_ONE
+        global _PIPE_ONE, _CUDA_ROWS
         if _PIPE_ONE and not getattr(nv, "_PIECES", False):
             note("  MOE_PIPE_ONE: off, it needs MOE_PIPE_PIECES", flush=True)
             _PIPE_ONE = False
+        k = top_k_of(model) or 1
+        _CUDA_ROWS = max(1, min(_CUDA_ROWS, 32 // k)) if _PIPE_ONE else 1
+        if "route_cuda" in globals():
+            route_cuda.ROWS = _CUDA_ROWS
+        if self.cuda and _CUDA_ROWS > 1:
+            t = time.perf_counter()
+            why = _rows_check(model, nv, _CUDA_ROWS)
+            if why is not None:
+                _rows_off(why)
+            else:
+                note(f"  T-row verify pass: {_CUDA_ROWS} rows, its kernels checked against MLX in "
+                     f"{time.perf_counter() - t:.2f} s", flush=True)
+        if self.cuda and _CUDA_ROWS > 1:
+            _rows_sdpa(model)
+            import spec
+            if not getattr(spec.Speculator._taped, "_rows", False):
+                spec.Speculator._taped = _verify_pass(spec.Speculator._taped)
+            if _SPEC_AHEAD:
+                spec.Speculator.ahead = _SPEC_AHEAD
+                spec.Speculator.watch = staticmethod(_watch)
+                spec.Speculator.post, spec.Speculator.peek = staticmethod(nv.verdict), staticmethod(nv.peek)
         if self.cuda and top_k_of(model):
             nv.warm(top_k_of(model))
             if _PIPE_ONE:
-                nv.warm_one(top_k_of(model))
+                for T in range(1, _CUDA_ROWS + 1):
+                    nv.warm_one(k, rows=T)
+                    if T > 1 and _ROWS_RUNS:
+                        nv.warm_one(k, rows=T, sort=True)
         self.pipe_stage = _PIPE_STAGING
         if self.pipe_stage:
             # Every layer but the last D guesses layer L + D's experts, the post kernel warmed before the agent exists as warm()'s are.
@@ -2503,7 +2638,10 @@ class _Native:
                 g._guess_next = _pipe_guess(m.gate, m.top_k)
                 nv.warm_guess(m.gate.weight.shape[0], m.top_k, mx.bfloat16 if _GUESS_BF16 else mx.float32)
                 if _PIPE_ONE:
-                    nv.warm_one(top_k_of(model), m.gate.weight.shape[0], mx.bfloat16 if _GUESS_BF16 else mx.float32)
+                    for T in range(1, _CUDA_ROWS + 1):
+                        for srt in (False, True) if T > 1 and _ROWS_RUNS else (False,):
+                            nv.warm_one(k, m.gate.weight.shape[0], mx.bfloat16 if _GUESS_BF16 else mx.float32, rows=T,
+                                        sort=srt)
         if _PIPE_HITS and top_k_of(model):
             # The held experts' chain needs the EXL3 kernels' skipped slots; another pack keeps one chain after the wait.
             for g in glus:
@@ -2513,6 +2651,9 @@ class _Native:
             _HITS_SKIP = mx.array(nv.SKIP, dtype=mx.uint32)
             mx.eval(_HITS_SKIP)
             note(f"  hits first: {sum(g._hits_first for g in glus)} of {len(glus)} layers (MOE_PIPE_HITS_FIRST=1)", flush=True)
+        if self.cuda and _CUDA_ROWS > 1:
+            # MOE_CUDA_ROWS: the agent's staging holds a T-row job whose every id misses (48 records held 16 ids of three parts)
+            os.environ.setdefault("MOE_PIPE_STAGE_RECORDS", str(_CUDA_ROWS * k * max(len(g._projs) for g in glus)))
         self.agent = nv.Agent(self.ev, fds.pop(), len(glus), readers)
         # The victim tier (CUDA): its slots, a slot's bytes, and the governor make_store_governor puts on it.
         self.tier_n = self.tier_slot = self.tier_rss0 = 0
@@ -2557,9 +2698,11 @@ class _Native:
 
     def fits(self, T):
         """A pass of T positions can go native: one, or under MOE_NATIVE_MTP T rows whose T x top_k ids one job carries and every layer's slots hold (the Python path's own arena test), with no staging rows."""
-        # Metal without staging only (the 35B's arena); T rows on CUDA or with staging guesses need the multi-row branch's warm-up and rank-major guesses.
-        return T == 1 or (_NATIVE_ROWS and not self.cuda and not self.stage and T * self.k <= 64
-                          and all(g._cap >= T * self.k for g in self.glus))
+        # Metal without staging (the 35B's arena), or CUDA's MOE_CUDA_ROWS (one MOE_PIPE_ONE job of T x top_k ids).
+        if T == 1:
+            return True
+        wide = (_ROWS_VERIFY and T <= _CUDA_ROWS) if self.cuda else (_NATIVE_ROWS and T * self.k <= 64)
+        return wide and not self.stage and all(g._cap >= T * self.k for g in self.glus)
 
     @staticmethod
     def _gen(g):
@@ -2570,7 +2713,7 @@ class _Native:
     def begin(self, T=1):
         """Token boundary of a native pass of T positions with the token before it done, False sending the pass to Python (an arena missing, or just resized)."""
         # MOE_CUDA_TOKEN_AHEAD: after a native token nothing below needs the agent idle, so settle() checks that token's jobs at this pass's end.
-        steady = self.cuda and T == 1 and self.owner == "agent" and _token_ahead()
+        steady = self.cuda and T <= _CUDA_ROWS and self.owner == "agent" and _token_ahead()
         self.ahead = int(self.nv._blk[self.nv.SENT]) if steady else None
         if not steady:
             self.drain()
@@ -2842,6 +2985,67 @@ def _hook_native_exit():
 _EXIT_HOOKED = False
 
 
+def _head_defaults():
+    """A head is loaded on CUDA's native resident path: its verify pass (HEAD_ROWS) and the rounds built ahead on unless the environment names them."""
+    global _CUDA_ROWS, _SPEC_AHEAD
+    if "MOE_CUDA_ROWS" not in os.environ and _CUDA_ROWS == 1:
+        _CUDA_ROWS = HEAD_ROWS
+        _install_rows()
+    if "MOE_SPEC_AHEAD" not in os.environ and _CUDA_ROWS > 1:
+        _SPEC_AHEAD = 1
+
+
+def _rows_check(model, nv, rows):
+    """The T-row path's kernels against MLX's one-row calls on this model's own 4-bit shapes and RoPE, and the verdict kernel against the arrays it posts: None when every bit agrees, else what parted."""
+    def same(a, b):
+        return a.shape == b.shape and bool(mx.all(a.view(mx.uint16) == b.view(mx.uint16)).item())
+    key = mx.random.key(7)
+    seen = set()
+    for m in model.modules():
+        if isinstance(m, nn.QuantizedLinear) and "biases" in m:
+            w = m["weight"]
+            sk = (w.shape, m.group_size, m.bits, m.mode)
+            if sk in seen:
+                continue
+            seen.add(sk)
+            x = mx.random.normal((1, rows, w.shape[1] * 32 // m.bits), key=key).astype(mx.bfloat16)
+            if not route_cuda.qmv_fits(x, w, m["scales"], m.group_size, m.bits, m.mode, m["biases"]):
+                continue
+            want = mx.concatenate([mx.quantized_matmul(x[:, i:i + 1], w, m["scales"], m["biases"], transpose=True,
+                                                       group_size=m.group_size, bits=4) for i in range(rows)], axis=1)
+            if not same(route_cuda.qmv_rows(x, w, m["scales"], m["biases"], m.group_size), want):
+                return f"qmv_rows {tuple(w.shape)} g{m.group_size}"
+        elif isinstance(m, nn.RoPE) and not m.traditional and ("rope", m.dims, m.base, m.scale) not in seen:
+            seen.add(("rope", m.dims, m.base, m.scale))
+            x = mx.random.normal((1, 4, rows, max(256, m.dims)), key=key).astype(mx.bfloat16)
+            want = mx.concatenate([_ROPE_CALL(m, x[..., i:i + 1, :], offset=1000 + i) for i in range(rows)], axis=2)
+            if not same(route_cuda.rope_rows(x, m.dims, m.base, m.scale, 1000), want):
+                return f"rope_rows dims {m.dims}"
+    if hasattr(nv, "verdict"):
+        am, dr = mx.array([11, 22], dtype=mx.uint32), mx.array([33], dtype=mx.int32)
+        mark, n = nv.verdict(am, dr)
+        mx.eval(mark)
+        if nv.peek(n, 3) != [11, 22, 33]:
+            return "verdict"
+    return None
+
+
+def _rows_off(why):
+    """The T-row path and the rounds built ahead off for this process, decoding going on as main's loop."""
+    global _CUDA_ROWS, _SPEC_AHEAD
+    note(f"  T-row verify pass: off for this process ({why} differs from MLX's one-row call)", flush=True)
+    _CUDA_ROWS, _SPEC_AHEAD = 1, 0
+    route_cuda.ROWS = 1
+    gl = sys.modules.get("gdn_cuda")
+    if gl is not None:
+        import mlx_lm.models.qwen3_5 as q35
+        cls = q35.GatedDeltaNet
+        if getattr(cls, "_gdn_glue", False) and getattr(cls, "_glue_rows", 1) > 1:
+            cls.__call__, cls._gdn_glue = cls._gdn_glue_orig, False
+            gl.install_glue(1)
+            cls._glue_rows = 1
+
+
 def install_native(model, glus, readers):
     """The token boundary for native passes, on the class owning the layer list and routed by the instance as install_defer is."""
     global _NATIVE
@@ -2877,6 +3081,7 @@ def install_native(model, glus, readers):
     sorig = scls.__call__
 
     def stack_call(self, inputs, *args, **kwargs):
+        global _MEASURING
         nat = _NATIVE
         if nat is None or nat.stack is not self:
             return sorig(self, inputs, *args, **kwargs)
@@ -2884,16 +3089,20 @@ def install_native(model, glus, readers):
         if T and kwargs.get("input_embeddings") is None and nat.ready() and nat.fits(T):
             if not nat.warm:
                 nat.warm = True         # CUDA: this pass on the Python path loads every kernel
-                nat.to_python()
-                return sorig(self, inputs, *args, **kwargs)
+                if T == 1:
+                    # MOE_CUDA_ROWS: a wider pass is not, since only the native one has a one-row pass's bits; its first-use kernels hold the host until the GPU drains, a stall, not a deadlock.
+                    nat.to_python()
+                    return sorig(self, inputs, *args, **kwargs)
             # The token before must be done, since its claims are what this one's cache bias ranks against and the agent's table is read here.
             # MOE_CUDA_TOKEN_AHEAD, after a native token: each router reads its own layer's slot table on the GPU, in GPU order, so the wait buys nothing.
-            if not (nat.cuda and T == 1 and nat.owner == "agent" and _token_ahead()):
+            if not (nat.cuda and T <= _CUDA_ROWS and nat.owner == "agent" and _token_ahead()):
                 mx.eval(inputs)
             if nat.begin(T):
                 STATS["native_rows"] += T > 1
                 nat.active = True
                 ple, ok = None, False
+                # MOE_CUDA_ROWS: chunkattn brackets a measured pass of 2+ rows with two syncs a layer, which a verify pass of a few rows does not need.
+                meas, _MEASURING = _MEASURING, (None if nat.cuda and T > 1 else _MEASURING)
                 try:
                     if T == 1:
                         ple = _ple_decode_ahead(self, inputs, args[0] if args else kwargs.get("cache"))
@@ -2902,6 +3111,7 @@ def install_native(model, glus, readers):
                     ok = True
                     return out
                 finally:
+                    _MEASURING = meas
                     nat.active = False
                     _ple_decode_done(self, ple, ok)
         nat.to_python()
@@ -3923,7 +4133,7 @@ class CacheBiasedMoE(nn.Module):
                     y = y + self._shared_out(x, early)
                 return y
         if (_BIAS_TAIL and self._lam > 0.0 and _NATIVE is not None and _NATIVE.active and x.ndim == 3
-                and x.shape[0] == 1 and x.shape[1] == 1 and self._tail_ok()):
+                and x.shape[0] == 1 and x.shape[1] <= route_cuda.MAX_T and self._tail_ok()):
             lg = b.gate(x)
             if lg.dtype == mx.bfloat16:
                 return self._bias_tail(x, lg)
@@ -4812,8 +5022,17 @@ class StreamingSwitchGLU(nn.Module):
                 early = self.__dict__.pop("_shared_early", None)
                 if early is not None:
                     self.__dict__["_shared_out"] = early(x)
-                rhs = nv.sync_rows(ids, self._native_idx, self._slot_of, lg, k)
-                y = self._experts(mx.expand_dims(x, (-2, -3)), [a[0] for a in _ARENAS[self._akey]], rhs)[2].squeeze(-2)
+                bufs = [a[0] for a in _ARENAS[self._akey]]
+                if _ROWS_RUNS and self._gguf is not None and ids.size > ids.shape[-1]:
+                    # MOE_CUDA_ROWS: the T x k rows sorted by slot (the handshake sorts them) through the run kernels, each slot's weights read once.
+                    _, srt, src, inv = nv.sync_rows(ids, self._native_idx, self._slot_of, lg, k, sort=True)
+                    x2 = x.reshape(-1, x.shape[-1])
+                    ys = gguf_experts.gemv(mx.take(x2, src, axis=0), tuple(b[0] for b in bufs), srt, 1,
+                                           tuple(self._gguf.split("/")), x.dtype)
+                    y = mx.take(ys, inv, axis=0).reshape(ids.shape + (x.shape[-1],))
+                else:
+                    rhs = nv.sync_rows(ids, self._native_idx, self._slot_of, lg, k)
+                    y = self._experts(mx.expand_dims(x, (-2, -3)), bufs, rhs)[2].squeeze(-2)
             else:
                 pre = None
                 if self._hits_first:
@@ -4847,7 +5066,8 @@ class StreamingSwitchGLU(nn.Module):
                                               self._exl3, skip=True)
                     y = mx.where(held[..., None, None], yh, ym).squeeze(-2)
             nat.unsent += 1
-            if nat.unsent < _eval_every() and self._native_idx < len(nat.glus) - 1:
+            every = _ROWS_EVAL if _ROWS_EVAL and ids.size > ids.shape[-1] else _eval_every()
+            if nat.unsent < every and self._native_idx < len(nat.glus) - 1:
                 return y        # MOE_CUDA_EVAL_EVERY: the next layers' async_eval takes this one along
             t = time.perf_counter()
             mx.async_eval(y)
@@ -4858,6 +5078,13 @@ class StreamingSwitchGLU(nn.Module):
             if t > 1e-3:
                 nat.holds += 1
                 nat.hold_s += t
+            if _HANDOFF is not None:
+                try:
+                    _HANDOFF()
+                except BaseException:
+                    # spec's round built ahead stops here: nothing of this layer is left for its next pass.
+                    self.__dict__.pop("_shared_out", None)
+                    raise
             return y
         v, nat.v = nat.v, nat.v + 2
         held = self.__dict__.pop("_ids32", None)
@@ -7504,6 +7731,8 @@ def install(model, model_path, resident=0, look_m=0, look_depth=1, cache_bias=0.
     if _RESIDENT and (not _CUDA_STAGE_ON or _STRIPE is not None):
         print("  resident: MOE_RESIDENT=1 needs MOE_CUDA_STAGE on and no stripe sidecar; off for this load", flush=True)
         _RESIDENT = False
+    if mtp and native and _RESIDENT:
+        _head_defaults()
     try:
         _cfg = json.loads((Path(model_path) / "config.json").read_text())
     except (OSError, ValueError):

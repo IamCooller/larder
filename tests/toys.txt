@@ -5,6 +5,8 @@ tests/test_empty_stream.py
 tests/test_stub_modes.py
 tests/test_mtp_seam.py
 tests/test_spec_rounds.py
+tests/test_spec_ahead.py
+tests/test_lead_policy.py
 tests/test_tui.py
 tests/test_engine_args.py
 tests/test_quiet_start.py
@@ -57,6 +59,7 @@ tests/test_native_exit_cuda.py
 tests/test_native_batch_cuda.py
 tests/test_bias_tail_cuda.py
 tests/test_gdn_glue_cuda.py
+tests/test_rows_cuda.py
 tests/test_pipe_staging_emu.py
 tests/test_native_exit.py
 tests/test_staging.py

@@ -37,6 +37,10 @@ def _restore(cache, snap):
                 f"{type(c).__name__} refused to give {c.offset - s} positions back")
 
 
+class _Discard(Exception):
+    """A round built ahead whose round before it was rejected (MOE_SPEC_AHEAD), raised at a hand-off of its build."""
+
+
 @dataclass
 class Stats:
     rounds: int = 0
@@ -54,6 +58,10 @@ class Stats:
     # kept out of the head's own counts.
     forced: int = 0
     forced_accepted: int = 0
+    # MOE_SPEC_AHEAD: rounds built ahead that became the next round, that were dropped, and of those cut at a hand-off.
+    ahead_used: int = 0
+    ahead_dropped: int = 0
+    ahead_cut: int = 0
 
     def note(self, d, ok):
         while len(self.seen) <= d:
@@ -148,7 +156,12 @@ class Speculator:
         """The head's guesses at the tokens after the last accepted one, its own method so
         a test can script them."""
         hs = mx.concatenate([p[0] for p in pairs], axis=1)
-        es = self.embed(mx.array([[p[1] for p in pairs]]))
+        toks = [p[1] for p in pairs]
+        if any(isinstance(t, mx.array) for t in toks):
+            # A round built ahead of its verdict (MOE_SPEC_AHEAD): the tokens are the last round's lazy ids.
+            es = self.embed(mx.concatenate([t.reshape(1, -1).astype(mx.int32) for t in toks], axis=1))
+        else:
+            es = self.embed(mx.array([toks]))
         h = self.head(hs, es, cache=hcache)
         kept = hcache[0].offset
         # No round trip: `gamma` ids as one int32 array; generate() feeds
@@ -193,6 +206,62 @@ class Speculator:
             a += 1
         out.append(bonus.item())
         return drafts, out, a
+
+    # MOE_SPEC_AHEAD (stream_fast sets these on CUDA's native T-row pass): the next round is built while the GPU finishes
+    # this one, as if every draft stands; `watch(fn)` has fn called after each hand-off of that build (None removes it),
+    # where this round's verdict is looked for with `peek(n, count)` (its ids once `post(am, drafts)` -> (array, n) has
+    # written them, else None) and read, waiting, at the `ahead`-th.
+    ahead = 0
+    watch = post = peek = None
+
+    def _round(self, pending, pairs, hcache, cache, gdn, st, snap, lead=0):
+        """MOE_SPEC_AHEAD: one greedy round built and handed to the GPU, its argmax rows and drafts lazy; `pending` is
+        a [1, k] int32 array, `lead` the tokens the round before emits if every draft stands (what _draft is told)."""
+        t0 = time.perf_counter()
+        st.tokens += lead
+        try:
+            drafts = self._draft(pairs, hcache, st)
+        finally:
+            st.tokens -= lead
+        if not isinstance(drafts, mx.array):
+            drafts = mx.array(drafts, dtype=mx.int32)
+        st.draft_s += time.perf_counter() - t0
+        t0 = time.perf_counter()
+        k = pending.shape[1]
+        H, tape = self._taped(mx.concatenate([pending, drafts[None]], axis=1), cache, gdn)
+        am = mx.argmax(self.lm_head(H[0, k - 1:k + drafts.size]), axis=-1)
+        n = None
+        if self.post is not None:
+            mark, n = self.post(am, drafts)
+            mx.async_eval(am, drafts, mark)
+        else:
+            mx.async_eval(am, drafts)
+        st.verify_s += time.perf_counter() - t0
+        return {"k": k, "drafts": drafts, "H": H, "tape": tape, "snap": snap, "am": am, "n": n, "verdict": None}
+
+    def _verdict(self, r, st, eos, max_tokens, wait=True):
+        """The round's tokens as the greedy loop below judges them: (out, a, each judged draft's hit, whether the
+        round built ahead of it is the next one), read once; None while the GPU has not written them and `wait` is off."""
+        if r["verdict"] is None:
+            g = r["drafts"].size
+            ids = self.peek(r["n"], 2 * g + 1) if r["n"] is not None else None
+            if ids is not None:
+                cand, drafts = ids[:g + 1], ids[g + 1:]
+            elif not wait:
+                return None
+            else:
+                mx.eval(r["am"], r["drafts"])
+                cand, drafts = r["am"].tolist(), r["drafts"].tolist()
+            out, a, hits = [cand[0]], 0, []
+            while a < len(drafts) and out[a] not in eos and st.tokens + len(out) < max_tokens:
+                hits.append(drafts[a] == out[a])
+                if drafts[a] != out[a]:
+                    break
+                a += 1
+                out.append(cand[a])
+            goes = a == len(drafts) and out[-1] not in eos and st.tokens + len(out) < max_tokens
+            r["verdict"] = (out, a, hits, goes)
+        return r["verdict"]
 
     # Off replays a rejection instead of rebuilding, which is also what a model gets
     # whose recurrent caches are not a GatedDeltaNet pair.
@@ -276,6 +345,10 @@ class Speculator:
         gdn = self._gdn_of(cache) if self.rebuild else None
         pairs = [(h, tok)]              # not yet seen by the draft head
         forcer = self.forcer
+        ahead = bool(self.ahead and self.watch is not None and self.sampling is None and forcer is None
+                     and gdn is not None)
+        cur = None      # MOE_SPEC_AHEAD: the round handed to the GPU and not yet judged
+        held = None     # (snapshot, head cache offset) under a round built ahead and still in the cache
         try:
             if forcer is not None:
                 forcer.feed(tok)
@@ -284,6 +357,63 @@ class Speculator:
             st.tokens += 1
 
             while st.tokens < max_tokens and emitted[-1] not in eos:
+                if ahead:
+                    held = None
+                    if cur is None:
+                        cur = self._round(mx.array([emitted[fed:]], dtype=mx.int32), pairs, hcache, cache, gdn, st,
+                                          snap)
+                    g = cur["drafts"].size
+                    nxt = pre = None
+                    if st.tokens + g + 1 < max_tokens:
+                        # The next round on this one's lazy ids as if every draft stands, built while the GPU finishes
+                        # this one; each hand-off looks for this round's verdict, the `ahead`-th waits for it, and a
+                        # rejection stops the build there.
+                        pre, hoff = _snapshot(cache), hcache[0].offset
+                        held, seen = (pre, hoff), [0]
+
+                        def check(r=cur, seen=seen):
+                            seen[0] += 1
+                            v = self._verdict(r, st, eos, max_tokens, wait=seen[0] >= self.ahead)
+                            if v is not None and not v[3]:
+                                raise _Discard
+                        toks = mx.concatenate([cur["drafts"], cur["am"][g:].astype(mx.int32)])
+                        opt = [(cur["H"][:, cur["k"] - 1 + j:cur["k"] + j], toks[j:j + 1]) for j in range(g + 1)]
+                        self.watch(check)
+                        try:
+                            nxt = self._round(toks[None, g:], opt, hcache, cache, gdn, st, pre, lead=g + 1)
+                            # Its verdict kernel may overwrite this round's ids in the block: read the arrays from here.
+                            cur["n"] = None
+                        except _Discard:
+                            st.ahead_cut += 1
+                        finally:
+                            self.watch(None)
+                    out, a, hits, goes = self._verdict(cur, st, eos, max_tokens)
+                    st.rounds += 1
+                    for j, ok in enumerate(hits):
+                        st.note(j, ok)
+                    if nxt is not None and goes:
+                        # Every draft stood: the round built ahead is the next one, its snapshot the one the loop
+                        # below would take now.
+                        fed = len(emitted) + a
+                        snap, cur = pre, nxt
+                        st.ahead_used += 1
+                    else:
+                        if pre is not None:
+                            _restore(cache, pre)
+                            hcache[0].trim(hcache[0].offset - hoff)
+                            held = None
+                            st.ahead_dropped += 1
+                        pairs = [(cur["H"][:, cur["k"] - 1 + j:cur["k"] + j], out[j]) for j in range(len(out))]
+                        if a < g:
+                            self._rebuild(cache, cur["snap"], cur["k"] + a, gdn, cur["tape"])
+                            st.rebuilds += 1
+                        fed = len(emitted) + a
+                        snap, cur = _snapshot(cache), None
+                    for t in out:
+                        yield t
+                        emitted.append(t)
+                        st.tokens += 1
+                    continue
                 t0 = time.perf_counter()
                 pending = emitted[fed:]
                 k = len(pending)
@@ -382,6 +512,10 @@ class Speculator:
                     emitted.append(t)
                     st.tokens += 1
         finally:
+            if held is not None:
+                # A round built ahead and not yet judged leaves the cache first.
+                _restore(cache, held[0])
+                hcache[0].trim(hcache[0].offset - held[1])
             # The tail the target never saw, without which the caller's cache is short
             # of `_seen`.
             rest = emitted[fed:]

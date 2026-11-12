@@ -211,7 +211,8 @@ The largest footprint with at least 1 GB of margin to the swap line on an idle M
 | one more store slot a layer | ~119 MB saves ~2 store misses a token at 47-55 slots; each extra NVMe expert costs ~0.85 ms | K4 with an 8-bit trunk, claim logs replayed | 2026-11-07 | coder_diag/gap |
 | the 35B held resident (VRAM plus pinned host RAM) | 12.7-12.95 GB of experts in VRAM and 5.1-5.4 GB in the pinned host tier, 0-216 of 10,240 left to the SSD; the fill reads 18.2 GB at 3.4 GB/s in 5.2-5.5 s; decode 73-79 tokens/s after a short prompt, 56-71 after 8k | a Q4_0 GGUF-derived 35B pack, `MOE_RESIDENT=1` | 2026-11-06 | cuda_resident |
 | its decode token | 10.41 ms with the exact decode fixes (embedding in VRAM, router and combine as two kernels) against 12.67 before; 1,892 -> 1,424 kernels a token. llama.cpp b11719 on the same card: 9.86 ms (6.7 of GPU work in 1,482 kernels + 3.1 of CPU experts) | the same pack | 2026-11-06 | decode35_cuda |
-| the launcher's 4-bit 35B | 61 to 70 tokens/s after a short prompt, 50 to 54 after an 8k prompt; reads an 8k prompt at 306 to 324 tokens/s; process peak 2.4-3.2 GB, 9.5-10.1 GB of VRAM in use (the desktop's ~0.6 GB included) | the launcher's own plan through `./larder` with a fresh home folder: the pack's 18.1 GB of experts resident in VRAM plus a pinned host-RAM tier (`MOE_RESIDENT=1`), cache bias 0.5 (gated on the M4's mixed pack, not on this pack), two repeats | 2026-11-07 | launcher35_pc |
+| the launcher's Q4_0 recipe for the 35B (what it installs on CUDA since 2026-11-11) | 146.5 / 147.3 tokens/s on short turns (turns 2 and 3, pass 1 / pass 2), 100.4 / 106.0 after an 8k prompt; reads an 8k prompt at 933 / 935 tokens/s, first token 8.67 / 8.65 s; with exact routing (cache bias 0, no head) 115.2 / 114.8, 91.6 / 91.7, 809 / 844 tokens/s | the Q4_0 GGUF's experts (18.20 GB after the repack) held resident across VRAM and a pinned host-RAM tier (`MOE_RESIDENT=1`), cache bias 0.5 at budget 0.2, the model's own MTP head (a 475 MB pack); against the published 4-bit pack, GSM8K-400 331 against 338 (p 0.25), HumanEval-164 149 against 148; installed in 6 min 25 s with no manual step; the launcher's own start within 1.7% of the hand-made command | 2026-11-11 | pc_vs_llama_1111, launcher_q40_pc, q40_quality_pc |
+| the launcher's 4-bit 35B (what it installed on the PC before 2026-11-11) | 61 to 70 tokens/s after a short prompt, 50 to 54 after an 8k prompt; reads an 8k prompt at 306 to 324 tokens/s; process peak 2.4-3.2 GB, 9.5-10.1 GB of VRAM in use (the desktop's ~0.6 GB included) | the launcher's own plan through `./larder` with a fresh home folder: the pack's 18.1 GB of experts resident in VRAM plus a pinned host-RAM tier (`MOE_RESIDENT=1`), cache bias 0.5 (gated on the M4's mixed pack, not on this pack), two repeats | 2026-11-07 | launcher35_pc |
 | dense Qwen3-8B | decode 80.1 tok/s (128 tokens after a 512-token prompt), prefill 2,388 tok/s, 6.0 GB of VRAM; llama.cpp on a Q4_0 of the same model 83.3 / 87.7 tok/s (flash attention off / on) | plain MLX on mlx-community's 4-bit weights, MLX 0.32.4, median of 3 | 2026-10-18 | pc_kernels |
 
 Facts about MLX's CUDA backend that shaped the PC's design (MLX 0.32.4):
@@ -243,7 +244,7 @@ The engine's guard aborts any run above 11 GB of footprint, on +40 MB of swap-ou
 
 ## 7. Against llama.cpp
 
-The same model, Qwen3.6-35B-A3B, against llama.cpp b11719 (the official prebuilt build) at the best setting of a sweep, greedy (temperature 0), thinking off on both sides. Quality was not compared on either machine. Neither comparison is like for like: the two sides ran different quantisations, and on the M4 this engine also used the model's MTP head and read most of its bytes from another drive (the internal SSD; about 11 GB a request came from the same external SSD).
+The same model, Qwen3.6-35B-A3B, against llama.cpp b11719 (the official prebuilt build) at the best setting of a sweep, greedy (temperature 0), thinking off on both sides. Quality was not compared in these tables (the 2026-11-11 recipe has its own paired gate, listed in 4.7). The M4 comparison and the PC's 2026-11-06 one are not like for like: the two sides ran different quantisations, and on the M4 this engine also used the model's MTP head and read most of its bytes from another drive (the internal SSD; about 11 GB a request came from the same external SSD).
 
 ### The M4 (2026-11-06)
 
@@ -262,7 +263,25 @@ The same model, Qwen3.6-35B-A3B, against llama.cpp b11719 (the official prebuilt
 
 Against llama.cpp's best arm at each size (CPU only at 1k and 4k, hybrid at 16k): decode 3.3x / 3.6x / 3.8x, first token 7.9x / 10x / 9.2x. llama.cpp maps the 17.7 GB file and leaves paging to macOS, so on 16 GB the weights do not stay in memory and a request re-reads 22-30 GB at 1k and 310-360 GB at 16k. This engine reads its routed experts into its own cache, 23-24 GB a request at every size. This engine was not run on the same GGUF: the repack did not fit the free disk.
 
-### The PC (2026-11-06 and 2026-11-07)
+### The PC (2026-11-11)
+
+The earlier comparison (2026-11-06 and 2026-11-07, below) put llama.cpp ahead of the launcher's then 4-bit setup by 1.4x to 1.9x on decode and 2.6x to 2.7x on reading the prompt. The launcher's 35B on CUDA has since become the Q4_0 recipe, and the comparison was repeated in one session.
+
+- **llama.cpp** (2026-11-11): the same bartowski Q4_0 GGUF, hybrid `-ngl 99 --n-cpu-moe 11 -t 6` for the decode and prompt cells. `--n-cpu-moe 10`, the best setting on 2026-11-09, ran out of memory in the cuBLAS workspace (the desktop held 649 to 687 MiB of the card against 553 to 605 MiB then) and 9 failed to allocate; 11 is the best that fits. At 8k, 11 was faster than the earlier 12 (97.4 against 94.8 tokens/s decode, 891 against 826 reading).
+- **This engine** (2026-11-11): the launcher's recipe as its dry run prints it (Q4_0 experts resident, cache bias 0.5 at budget 0.2, the model's MTP head), and the same pack with exact routing (cache bias 0, no head). A fresh server an arm, the pack out of the page cache before each; one warm request, then three 512-token replies to the short prompt and a 256-token reply after the 8k prompt.
+- One alternation in both orders (pass 1 / pass 2); a cell is that order's value, no best-of. Quality was not compared.
+
+| | recipe | exact routing | llama.cpp, `--n-cpu-moe 11` | recipe / llama.cpp | exact / llama.cpp |
+|---|---|---|---|---|---|
+| decode on short turns (turns 2 and 3), tokens/s | 146.5 / 147.3 | 115.2 / 114.8 | 99.6 / 100.7 | 1.47x / 1.46x | 1.16x / 1.14x |
+| decode, 256 tokens after an 8k prompt, tokens/s | 100.4 / 106.0 | 91.6 / 91.7 | 97.4 / 97.3 | 1.03x / 1.09x | 0.94x / 0.94x |
+| reading the 8k prompt, tokens/s | 933 / 935 | 809 / 844 | 891 / 904 | 1.05x / 1.03x | 0.91x / 0.93x |
+| first token after the 8k prompt, s | 8.67 / 8.65 | 9.99 / 9.58 | 9.07 / 8.94 | | |
+| first token after the short prompt (turn 1), s | 1.06 / 1.00 | 0.40 / 0.35 | 1.31 / 1.33 | | |
+
+Differences under 10% are level: the recipe after 8k and exact routing's 6% to 9% behind are stated with their signs, not as wins or losses. This engine's short prompt was 144 tokens against llama.cpp's 132, its first token includes the HTTP round trip, its 8k reply followed three short turns on the same server while llama.cpp's was a fresh process, and llama.cpp's expert placement is fixed by `--n-cpu-moe` while this engine's store sizes itself from the free VRAM. The recipe's replies differ run to run (cache bias 0.5 makes routing depend on the store's state); exact routing's short replies were identical in all six turns. Against `--n-cpu-moe 10` at the earlier 102.4 to 103.2 tokens/s the recipe would be 1.42x to 1.44x and exact routing 1.11x to 1.12x on short turns. Evidence: pc_vs_llama_1111 (private); the recipe's gate and install are in q40_quality_pc and launcher_q40_pc.
+
+### The PC (2026-11-06 and 2026-11-07, history: the launcher's 4-bit setup)
 
 - **llama.cpp** (2026-11-06): bartowski's `Qwen_Qwen3.6-35B-A3B-Q4_0.gguf` (20.8 GB, experts in Q4_0 / Q4_1, about 4.5 bits a weight), hybrid `-ngl 99 --n-cpu-moe N -t 6`.
 - **This engine** (2026-11-07): the launcher's published 4-bit pack (group 64, 8-bit embeddings and gates), started by `./larder` with a fresh home folder: experts resident in VRAM plus a pinned host-RAM tier, cache bias 0.5 (its paired gate ran on the M4's mixed pack, not on this pack on CUDA), no MTP head. One fresh server a prompt, two repeats.

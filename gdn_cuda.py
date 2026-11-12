@@ -116,9 +116,11 @@ __device__ __forceinline__ U gdn_silu(U x) { return mlx::core::cu::Multiply{}(x,
 """
 
 _SRC_STEP_GLUE = """
-  // A block: RB value rows of one value head. Its threads first make the head's q and k (silu, norm, scale) once,
-  // into shared memory, then each warp runs _SRC's recurrence for its row.
+  // A block: RB value rows of one value head over NR positions in order (one a decode row, T a verify pass). Each
+  // position: the threads make the head's q and k (silu, norm, scale) once into shared memory, then each warp runs
+  // _SRC's recurrence step for its row, the state staying in registers.
   constexpr int NPT = Dk / 32;
+  constexpr int CD = 2 * Hk * Dk + Hv * Dv;
   __shared__ InT sv[2 * Dk];
   __shared__ float qk[2 * Dk];
   __shared__ float nrm[2], gb[2];
@@ -130,62 +132,69 @@ _SRC_STEP_GLUE = """
   const int w = threadIdx.y;
   const int t = w * 32 + lane;
   const int dv = blockIdx.y * blockDim.y + w;
+  const bool live = dv < Dv;
   // the row's state and v first, so their loads run under the q / k work below
-  const long so = ((long)hv * Dv + (dv < Dv ? dv : 0)) * Dk + lane * NPT;
+  const long so = ((long)hv * Dv + (live ? dv : 0)) * Dk + lane * NPT;
   float s[NPT];
   for (int i = 0; i < NPT; ++i) s[i] = static_cast<float>(state_in[so + i]);
-  const InT vr = conv[2 * Hk * Dk + hv * Dv + (dv < Dv ? dv : 0)];
-  if (t < 2 * Dk) sv[t] = gdn_silu(conv[(t < Dk ? hk : Hk + hk - 1) * Dk + t]);
-  if (t == 2 * Dk) {
-    gb[1] = static_cast<float>(Sigmoid{}(b[hv]));
-    const float en = Negative{}(Exp{}(static_cast<float>(A_log[hv])));
-    const TS s0 = Add{}(static_cast<TS>(a[hv]), static_cast<TS>(dt_bias[hv]));
-    const TS sp = LogAddExp{}(s0, static_cast<TS>(0));
-    gb[0] = Exp{}(Multiply{}(en, static_cast<float>(sp)));
-  }
-  __syncthreads();
-  if (w < 2) {
-    // rms_norm_small's sum of squares for q (warp 0) and k (warp 1)
-    float n = 0.0f;
-    if (lane < Dk / 8) {
-      for (int j = 0; j < 8; ++j) {
-        const float x = static_cast<float>(sv[w * Dk + lane * 8 + j]);
-        n += x * x;
-      }
+  for (int r = 0; r < NR; ++r) {
+    const InT* cv = conv + (long)r * CD;
+    const InT vr = cv[2 * Hk * Dk + hv * Dv + (live ? dv : 0)];
+    if (t < 2 * Dk) sv[t] = gdn_silu(cv[(t < Dk ? hk : Hk + hk - 1) * Dk + t]);
+    if (t == 2 * Dk) {
+      gb[1] = static_cast<float>(Sigmoid{}(b[r * Hv + hv]));
+      const float en = Negative{}(Exp{}(static_cast<float>(A_log[hv])));
+      const TS s0 = Add{}(static_cast<TS>(a[r * Hv + hv]), static_cast<TS>(dt_bias[hv]));
+      const TS sp = LogAddExp{}(s0, static_cast<TS>(0));
+      gb[0] = Exp{}(Multiply{}(en, static_cast<float>(sp)));
     }
-    n = cg::reduce(warp, n, cg::plus<float>());
-    if (lane == 0) nrm[w] = rsqrt(n / Dk + eps[0]);
+    __syncthreads();
+    if (w < 2) {
+      // rms_norm_small's sum of squares for q (warp 0) and k (warp 1)
+      float n = 0.0f;
+      if (lane < Dk / 8) {
+        for (int j = 0; j < 8; ++j) {
+          const float x = static_cast<float>(sv[w * Dk + lane * 8 + j]);
+          n += x * x;
+        }
+      }
+      n = cg::reduce(warp, n, cg::plus<float>());
+      if (lane == 0) nrm[w] = rsqrt(n / Dk + eps[0]);
+    }
+    __syncthreads();
+    if (t < 2 * Dk) {
+      const InT y = static_cast<InT>(static_cast<float>(sv[t]) * nrm[t < Dk ? 0 : 1]);
+      qk[t] = static_cast<float>(Multiply{}(y, t < Dk ? sq[0] : sk[0]));
+    }
+    __syncthreads();
+    if (live) {
+      float qf[NPT], kf[NPT];
+      for (int i = 0; i < NPT; ++i) {
+        qf[i] = qk[lane * NPT + i];
+        kf[i] = qk[Dk + lane * NPT + i];
+      }
+      const float vf = static_cast<float>(gdn_silu(vr));
+      const float bf = gb[1];
+      const float gf = gb[0];
+      float kv = 0.0f;
+      for (int i = 0; i < NPT; ++i) {
+        s[i] = s[i] * gf;
+        kv += s[i] * kf[i];
+      }
+      kv = gdn_warp_sum(kv);
+      const float delta = (vf - kv) * bf;
+      float out = 0.0f;
+      for (int i = 0; i < NPT; ++i) {
+        s[i] = s[i] + kf[i] * delta;
+        out += s[i] * qf[i];
+      }
+      out = gdn_warp_sum(out);
+      if (lane == 0) y[((long)r * Hv + hv) * Dv + dv] = static_cast<InT>(out);
+    }
+    __syncthreads();      // the next position rewrites sv, qk, nrm and gb
   }
-  __syncthreads();
-  if (t < 2 * Dk) {
-    const InT y = static_cast<InT>(static_cast<float>(sv[t]) * nrm[t < Dk ? 0 : 1]);
-    qk[t] = static_cast<float>(Multiply{}(y, t < Dk ? sq[0] : sk[0]));
-  }
-  __syncthreads();
-  if (dv >= Dv) return;
-  float qf[NPT], kf[NPT];
-  for (int i = 0; i < NPT; ++i) {
-    qf[i] = qk[lane * NPT + i];
-    kf[i] = qk[Dk + lane * NPT + i];
-  }
-  const float vf = static_cast<float>(gdn_silu(vr));
-  const float bf = gb[1];
-  const float gf = gb[0];
-  float kv = 0.0f;
-  for (int i = 0; i < NPT; ++i) {
-    s[i] = s[i] * gf;
-    kv += s[i] * kf[i];
-  }
-  kv = gdn_warp_sum(kv);
-  const float delta = (vf - kv) * bf;
-  float out = 0.0f;
-  for (int i = 0; i < NPT; ++i) {
-    s[i] = s[i] + kf[i] * delta;
-    out += s[i] * qf[i];
-  }
-  out = gdn_warp_sum(out);
-  if (lane == 0) y[hv * Dv + dv] = static_cast<InT>(out);
-  for (int i = 0; i < NPT; ++i) state_out[so + i] = static_cast<StT>(s[i]);
+  if (live)
+    for (int i = 0; i < NPT; ++i) state_out[so + i] = static_cast<StT>(s[i]);
 """
 
 _SRC_NORM_GATE = """
@@ -224,10 +233,12 @@ def _scalar(v, dt):
 
 
 def step_glue(conv, a, b, A_log, dt_bias, state, Hk, Dk, Hv, Dv):
-    """One position of qwen3_5's GatedDeltaNet from the conv output (before silu): conv [1, 1, 2 Hk Dk + Hv Dv], a / b
-    [1, 1, Hv], A_log / dt_bias [Hv], state [1, Hv, Dv, Dk] -> (y [1, 1, Hv, Dv] in conv's dtype, the new state),
-    equal to silu, the split, normalize_qk, gated_delta_update's sigmoid / compute_g and recurrence."""
-    assert conv.shape[:2] == (1, 1) and Dk % 32 == 0 and Dk <= 128 and Hv % Hk == 0, (conv.shape, Dk)
+    """T positions of qwen3_5's GatedDeltaNet from the conv output (before silu): conv [1, T, 2 Hk Dk + Hv Dv], a / b
+    [1, T, Hv], A_log / dt_bias [Hv], state [1, Hv, Dv, Dk] -> (y [1, T, Hv, Dv] in conv's dtype, the new state),
+    equal to silu, the split, normalize_qk, gated_delta_update's sigmoid / compute_g and recurrence, position by
+    position as T one-position calls."""
+    assert conv.shape[0] == 1 and Dk % 32 == 0 and Dk <= 128 and Hv % Hk == 0, (conv.shape, Dk)
+    nr = conv.shape[1]
     inv = Dk ** -0.5
     k = _KERNELS.get("step_glue")
     if k is None:
@@ -238,8 +249,8 @@ def step_glue(conv, a, b, A_log, dt_bias, state, Hk, Dk, Hv, Dv):
     return k(inputs=[conv, a, b, A_log, dt_bias, state, _scalar(inv ** 2, conv.dtype), _scalar(inv, conv.dtype),
                      _scalar(1e-6 * inv ** 2, mx.float32)],
              template=[("InT", conv.dtype), ("StT", state.dtype), ("TS", ts), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk),
-                       ("Hv", Hv)],
-             grid=(32, -(-Dv // 16) * 16, Hv), threadgroup=(32, 16, 1), output_shapes=[(1, 1, Hv, Dv), state.shape],
+                       ("Hv", Hv), ("NR", nr)],
+             grid=(32, -(-Dv // 16) * 16, Hv), threadgroup=(32, 16, 1), output_shapes=[(1, nr, Hv, Dv), state.shape],
              output_dtypes=[conv.dtype, state.dtype])
 
 
@@ -257,8 +268,9 @@ def norm_gate(x, z, weight, eps):
              grid=(32, -(-r // 4) * 4, 1), threadgroup=(32, 4, 1), output_shapes=[x.shape], output_dtypes=[x.dtype])[0]
 
 
-def install_glue():
-    """MOE_CUDA_GDN_GLUE: qwen3_5.GatedDeltaNet's decode row through step_glue() and norm_gate(), its other calls as they are."""
+def install_glue(rows=1):
+    """MOE_CUDA_GDN_GLUE: qwen3_5.GatedDeltaNet's decode row, and passes of up to `rows` positions (MOE_CUDA_ROWS), through
+    step_glue() and norm_gate(), its other calls as they are."""
     import mlx_lm.models.qwen3_5 as q35
 
     cls = q35.GatedDeltaNet
@@ -273,13 +285,15 @@ def install_glue():
 
     def __call__(self, inputs, mask=None, cache=None):
         B, S, _ = inputs.shape
-        if not (B == 1 and S == 1 and mask is None and cache is not None and cache[1] is not None
+        # With rows > 1 the dtypes are read off the child modules (self[n]), which a speculative round's tape shadows with functions.
+        mods = [self[n] if rows > 1 else getattr(self, n) for n in ("in_proj_qkv", "in_proj_a", "in_proj_b", "conv1d")]
+        if not (B == 1 and S <= rows and mask is None and cache is not None and cache[1] is not None
                 and getattr(cache, "lengths", None) is None and self.sharding_group is None and not self.training
                 and inputs.dtype == mx.bfloat16 and self.head_k_dim % 32 == 0 and self.head_k_dim <= 128
                 and self.head_v_dim <= 256 and self.head_v_dim % 8 == 0 and self.norm.weight.dtype == mx.bfloat16
-                and all(bf16_out(m) for m in (self.in_proj_qkv, self.in_proj_a, self.in_proj_b, self.conv1d))):
+                and all(bf16_out(m) for m in mods)):
             return orig(self, inputs, mask, cache)
-        # mlx_lm's lines up to the conv, for S = 1 and no mask
+        # mlx_lm's lines up to the conv, for S <= rows and no mask
         qkv = self.in_proj_qkv(inputs)
         z = self.in_proj_z(inputs).reshape(B, S, self.num_v_heads, self.head_v_dim)
         b = self.in_proj_b(inputs)
