@@ -279,7 +279,25 @@ The earlier comparison (2026-11-06 and 2026-11-07, below) put llama.cpp ahead of
 | first token after the 8k prompt, s | 8.67 / 8.65 | 9.99 / 9.58 | 9.07 / 8.94 | | |
 | first token after the short prompt (turn 1), s | 1.06 / 1.00 | 0.40 / 0.35 | 1.31 / 1.33 | | |
 
-Differences under 10% are level: the recipe after 8k and exact routing's 6% to 9% behind are stated with their signs, not as wins or losses. This engine's short prompt was 144 tokens against llama.cpp's 132, its first token includes the HTTP round trip, its 8k reply followed three short turns on the same server while llama.cpp's was a fresh process, and llama.cpp's expert placement is fixed by `--n-cpu-moe` while this engine's store sizes itself from the free VRAM. The recipe's replies differ run to run (cache bias 0.5 makes routing depend on the store's state); exact routing's short replies were identical in all six turns. Against `--n-cpu-moe 10` at the earlier 102.4 to 103.2 tokens/s the recipe would be 1.42x to 1.44x and exact routing 1.11x to 1.12x on short turns. Evidence: pc_vs_llama_1111 (private); the recipe's gate and install are in q40_quality_pc and launcher_q40_pc.
+The reading rows above are against llama.cpp's default batch (`-b 2048 -ub 512`). A later session the same night found that a bigger batch reads faster; see "Prompt reading against llama.cpp's batch size" below. Differences under 10% are level: the recipe after 8k and exact routing's 6% to 9% behind are stated with their signs, not as wins or losses. This engine's short prompt was 144 tokens against llama.cpp's 132, its first token includes the HTTP round trip, its 8k reply followed three short turns on the same server while llama.cpp's was a fresh process, and llama.cpp's expert placement is fixed by `--n-cpu-moe` while this engine's store sizes itself from the free VRAM. The recipe's replies differ run to run (cache bias 0.5 makes routing depend on the store's state); exact routing's short replies were identical in all six turns. Against `--n-cpu-moe 10` at the earlier 102.4 to 103.2 tokens/s the recipe would be 1.42x to 1.44x and exact routing 1.11x to 1.12x on short turns. Evidence: pc_vs_llama_1111 (private); the recipe's gate and install are in q40_quality_pc and launcher_q40_pc.
+
+#### Prompt reading against llama.cpp's batch size (2026-11-11, later session, one run each)
+
+llama.cpp b11719, the same Q4_0 GGUF, the 8k prompt (8,074 tokens), 16 tokens out, GGUF warm. The table above ran at llama.cpp's default batch, `-b 2048 -ub 512`.
+
+| llama.cpp setting | `--n-cpu-moe` | prompt, tokens/s | first token, s | decode of the 16 tokens, tokens/s |
+|---|---|---|---|---|
+| default (`-b 2048 -ub 512`) | 11 | 899.6 / 891.3 | 8.98 / 9.06 | 85.7 / 86.6 |
+| `-ub 2048 -b 2048` | 11 | does not fit (compute buffer, out of memory) | | |
+| `-ub 4096 -b 4096` | 11 | does not fit (compute buffer, out of memory) | | |
+| `-ub 2048 -b 2048` | 15 | 1,259.9 | 6.41 | 77.2 |
+| `-ub 4096 -b 4096` | 20 | **1,639.7** | **4.92** | 72.5 |
+
+This engine in the same session read the 8k prompt at 916 / 915 tokens/s (the recipe, first token 8.83 s) and 852 / 842 (exact routing, 9.49 / 9.61 s). Against llama.cpp's 4096 setting that is 0.56x and 0.52x: llama.cpp reads the prompt about 1.8x faster than this engine, so the earlier 1.03x to 1.05x holds only against llama.cpp's default batch. The bigger batch needs a 2 to 4 GB compute buffer, so it fits only with more expert layers on the CPU, and those cost decode (72.5 tokens/s at 20 against 86 at 11, 16-token runs); a llama.cpp user picks one setting for both. The settings at 15 and 20 were chosen to fit, not swept, and each ran once, so 1,640 is a floor for llama.cpp's best. The decode comparison above stands as published, against the default setting.
+
+#### Strata (2026-11-11, same PC)
+
+Strata (github.com/Niko1221/Strata, v0.2.13) keeps all of a model's experts in RAM; for this model that is 20.1 GB, and its setup asks for 32 GB. On this PC (16 GB of VRAM, 15 GB of RAM) its own server was started in four settings (its setup's default, with `--mmap-experts`, with a 32K context and no MTP, with `--resident-budget-gib 4`); each began swapping within about ten seconds, 526 to 629 MB past the start, over the +512 MB limit of these runs, and answered no request. The engine for this model rejects its mapped and budgeted switches. No Strata speed was measured and the limit was not loosened. Evidence: strata_pc_1111 (private).
 
 ### The PC (2026-11-06 and 2026-11-07, history: the launcher's 4-bit setup)
 
