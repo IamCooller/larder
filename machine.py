@@ -110,9 +110,12 @@ def _key(f):
     return hashlib.sha1(json.dumps(k, sort_keys=True).encode()).hexdigest()[:12]
 
 
+KEY = []             # set by a process that must not open the GPU (launch.py --serve): reading facts imports MLX
+
+
 def fingerprint():
     """The key this machine's profile is cached under: hardware, OS and MLX version."""
-    return _key(facts())
+    return KEY[0] if KEY else _key(facts())
 
 
 def profile(refresh=False, measure=True):

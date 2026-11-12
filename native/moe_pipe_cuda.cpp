@@ -22,6 +22,8 @@
 // Job v sits at 64 + 128 * (v % RING) as [v, layer, n, ids[n]], its miss counts at 1536 + (v % 128) as misses | tier hits << 8 | experts put in the
 // tier << 16, and the wait's log under MOE_PIPE_LOG=1 at 2048 + 16 * (v % 128) with 8 uint64 a job.
 //
+// MOE_SPEC_AHEAD's verdict (moe_pipe_cuda.verdict) sits at 1280 as [round, argmax rows, draft ids], up to 1313.
+//
 // The agent's log at 4096 + 10 * (v % 128) holds 5 uint64 a job for v, noticed, claimed, records landed and answered in ns, and 6144 + r holds the
 // job's v once record r has landed in staging or is in the tier.
 //
@@ -146,7 +148,9 @@ static void check(CUresult rc, const char* what) {
 enum { kPosted = 0, kDone = 1, kRelease = 2, kGave = 3, kBeat = 4, kSent = 5, kBeating = 6, kClaimed = 7,
        kNoticed = 10, kRing = 64, kMiss = 1536, kLog = 2048, kAgentLog = 4096, kReady = 6144, kGuess = 7168, kPlan = 8192 };
 static const int RING = 8, ENTRY = 128, MAX_IDS = ENTRY - 3, BLOCK_BYTES = 65536;
-static const int STAGE_RECORDS = 48;  // Staging room: a top-10 layer of three projections is 30 records.
+// Staging room: a top-10 layer of three projections is 30 records; MOE_PIPE_STAGE_RECORDS raises it (a T-row job's misses,
+// stream_fast's MOE_CUDA_ROWS), read when an agent is made.
+static int STAGE_RECORDS = 48;
 static const int GUESS_WORDS = 32, GUESS_RECORDS = 30;  // A guess entry's words, and the records of one half of the guess room.
 static const int PLAN_WORDS = 8, PLAN_COPIES = 1020;  // The most copies a job may have, since 8192 + 4 + 8 x 1020 words fit the block.
 static const size_t PAGE = 4096;      // O_DIRECT's alignment, which the drive's logical block is at most.
@@ -484,6 +488,8 @@ class Agent {
     // For tests, MOE_PIPE_SLOW_US holds every job that long before it is answered.
     if (const char* e = getenv("MOE_PIPE_SLOW_US"))
       slow_us_ = atoi(e);
+    if (const char* e = getenv("MOE_PIPE_STAGE_RECORDS"))
+      STAGE_RECORDS = std::max(48, atoi(e));
     // Open the same file again with O_DIRECT, falling back to buffered reads on a file system
     // that lacks it, and read MOE_PIPE_CHUNK as the bytes the GPU copies at a time.
     const char* c = getenv("MOE_PIPE_CHUNK");

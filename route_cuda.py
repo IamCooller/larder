@@ -25,6 +25,8 @@ instead of a host-made array.
 import mlx.core as mx
 
 MAX_T = 5
+# MOE_CUDA_ROWS (stream_fast sets it): the widest pass the unbiased block's probs() / tail() take, 1 the decode row only.
+ROWS = 1
 _KERNELS = {}
 _SCALARS = {}
 
@@ -189,13 +191,17 @@ _TAIL_HEADER = """
 """
 
 _SRC_PROBS = """
+  // one warp a row (NR rows, MOE_CUDA_ROWS), each row as the one-row kernel
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<32>(block);
-  const int lane = threadIdx.x;
-  __shared__ T sg[256];
-  __shared__ unsigned pk[KT];
+  const int lane = threadIdx.x & 31;
+  const int r = threadIdx.x >> 5;
+  __shared__ T sgs[NR * 256];
+  __shared__ unsigned pks[NR * KT];
+  T* sg = sgs + r * 256;
+  unsigned* pk = pks + r * KT;
   float v[8];
-  for (int i = 0; i < 8; ++i) v[i] = static_cast<float>(logits[lane * 8 + i]);
+  for (int i = 0; i < 8; ++i) v[i] = static_cast<float>(logits[r * 256 + lane * 8 + i]);
   float prevmax = Limits<float>::finite_min();
   float maxval = prevmax;
   float normalizer = 0.0f;
@@ -242,17 +248,18 @@ _SRC_PROBS = """
       for (int j = 0; j < KT; ++j) sum = __hadd_rn(sum, sg[pk[j]]);
       s = s / sum;
     }
-    inds[lane] = e;
-    scores[lane] = s;
+    inds[r * KT + lane] = e;
+    scores[r * KT + lane] = s;
   }
 """
 
 _SRC_TAIL = """
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= D) return;
+  if (j >= NR * D) return;
+  const int r = j / D, c = j - r * D;
   T acc = static_cast<T>(0.0f);
-  for (int e = 0; e < KT; ++e) acc = __hadd_rn(acc, __hmul_rn(y[e * D + j], scores[e]));
-  const T sig = Sigmoid{}(gate[0]);
+  for (int e = 0; e < KT; ++e) acc = __hadd_rn(acc, __hmul_rn(y[(r * KT + e) * D + c], scores[r * KT + e]));
+  const T sig = Sigmoid{}(gate[r]);
   out[j] = __hadd_rn(acc, __hmul_rn(sig, shared[j]));
 """
 
@@ -271,21 +278,24 @@ def _tail_kernel(name):
 
 
 def probs(logits, k, norm):
-    """mlx_lm's router on one row of 256 bf16 logits [1, 1, 256] -> (inds uint32 [1, 1, k], scores bf16
-    [1, 1, k]), equal to softmax(precise), argpartition(-k)[..., -k:], take_along_axis and, with `norm`,
+    """mlx_lm's router on T rows of 256 bf16 logits [1, T, 256] -> (inds uint32 [1, T, k], scores bf16
+    [1, T, k]), each row equal to softmax(precise), argpartition(-k)[..., -k:], take_along_axis and, with `norm`,
     scores / scores.sum(-1)."""
-    return _tail_kernel("probs")(inputs=[logits], template=[("T", logits.dtype), ("KT", k), ("NORM", bool(norm))],
-                                 grid=(32, 1, 1), threadgroup=(32, 1, 1), output_shapes=[(1, 1, k)] * 2,
+    t = logits.shape[1]
+    return _tail_kernel("probs")(inputs=[logits], template=[("T", logits.dtype), ("KT", k), ("NORM", bool(norm)),
+                                                            ("NR", t)],
+                                 grid=(32 * t, 1, 1), threadgroup=(32 * t, 1, 1), output_shapes=[(1, t, k)] * 2,
                                  output_dtypes=[mx.uint32, logits.dtype])
 
 
 def tail(y, scores, shared, gate):
-    """(y * scores[..., None]).sum(-2) + sigmoid(gate) * shared for one row: y [1, 1, k, D], scores [1, 1, k],
-    shared [1, 1, D], gate [1, 1, 1], all bf16."""
-    k, d = y.shape[-2:]
-    return _tail_kernel("tail")(inputs=[y, scores, shared, gate], template=[("T", y.dtype), ("KT", k), ("D", d)],
-                                grid=(-(-d // 256) * 256, 1, 1), threadgroup=(256, 1, 1),
-                                output_shapes=[(1, 1, d)], output_dtypes=[y.dtype])[0]
+    """(y * scores[..., None]).sum(-2) + sigmoid(gate) * shared for T rows, each as the one-row ops: y [1, T, k, D],
+    scores [1, T, k], shared [1, T, D], gate [1, T, 1], all bf16."""
+    t, k, d = y.shape[-3:]
+    return _tail_kernel("tail")(inputs=[y, scores, shared, gate],
+                                template=[("T", y.dtype), ("KT", k), ("D", d), ("NR", t)],
+                                grid=(-(-t * d // 256) * 256, 1, 1), threadgroup=(256, 1, 1),
+                                output_shapes=[(1, t, d)], output_dtypes=[y.dtype])[0]
 
 
 # MOE_CUDA_BIAS_TAIL (stream_fast): the same two-launch form for CacheBiasedMoE's decode row at a cache bias above
@@ -421,7 +431,8 @@ def _tail_class(cls):
     """cls with its decode row through probs() and tail(), every other call as cls has it."""
     if cls not in _TAIL_CLASSES:
         def __call__(self, x):
-            if x.size != x.shape[-1] or x.dtype != mx.bfloat16:
+            rows = x.size // x.shape[-1]
+            if x.ndim != 3 or x.shape[0] != 1 or not (rows == 1 or rows <= ROWS) or x.dtype != mx.bfloat16:
                 return cls.__call__(self, x)
             inds, scores = probs(self.gate(x), self.top_k, self.norm_topk_prob)
             y = self.switch_mlp(x, inds)
@@ -444,3 +455,137 @@ def install_tail(blocks):
             b.__class__ = _tail_class(type(b))
             n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# MOE_CUDA_ROWS: a 4-bit affine matmul of T bf16 rows, each row with the arithmetic of MLX 0.32.4's one-row qmv_kernel
+# (qmm/qmv.cu: a warp an output row, 16 bf16 partial sums a lane, a float slot-order sum, the xor butterfly). MLX runs
+# up to 7 rows as one-row passes over the weights, and here each k step's weights are dequantized once for all T rows.
+_SRC_QMV = """
+  const int N = w_shape[0];
+  const int K = w_shape[1] * 8;
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * RPB + (threadIdx.x >> 5);
+  if (row >= N) return;
+  const uint32_t* wr = w + (long)row * (K / 8);
+  const __nv_bfloat16* sr = reinterpret_cast<const __nv_bfloat16*>(scales) + (long)row * (K / G);
+  const __nv_bfloat16* br = reinterpret_cast<const __nv_bfloat16*>(biases) + (long)row * (K / G);
+  const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(x);
+  const __nv_bfloat162 z2 = __halves2bfloat162(__ushort_as_bfloat16(0u), __ushort_as_bfloat16(0u));
+  __nv_bfloat162 sums[NR][8];
+  for (int r = 0; r < NR; ++r)
+    for (int i = 0; i < 8; ++i) sums[r][i] = z2;
+  for (int base = 0; base < K; base += 512) {
+    const int idx = base + lane * 16;
+    if (idx >= K) break;
+    const uint2 wv = *reinterpret_cast<const uint2*>(wr + (idx >> 3));
+    const __nv_bfloat162 ss = __halves2bfloat162(sr[idx / G], sr[idx / G]);
+    const __nv_bfloat162 bb = __halves2bfloat162(br[idx / G], br[idx / G]);
+    const uint32_t words[2] = {wv.x, wv.y};
+    __nv_bfloat162 wd[8];
+    for (int p = 0; p < 8; ++p) {
+      const uint32_t byte2 = (words[p >> 2] >> ((p & 3) * 8)) & 0xffu;
+      const __nv_bfloat162 q = __halves2bfloat162(__int2bfloat16_rn((int)(byte2 & 0xfu)),
+                                                 __int2bfloat16_rn((int)(byte2 >> 4)));
+      wd[p] = __hadd2(__hmul2(q, ss), bb);
+    }
+    for (int r = 0; r < NR; ++r) {
+      const uint4 xa = *reinterpret_cast<const uint4*>(xb + (long)r * K + idx);
+      const uint4 xc = *reinterpret_cast<const uint4*>(xb + (long)r * K + idx + 8);
+      const uint32_t xs[8] = {xa.x, xa.y, xa.z, xa.w, xc.x, xc.y, xc.z, xc.w};
+      for (int p = 0; p < 8; ++p) {
+        const __nv_bfloat162 xp = __halves2bfloat162(__ushort_as_bfloat16((unsigned short)(xs[p] & 0xffffu)),
+                                                    __ushort_as_bfloat16((unsigned short)(xs[p] >> 16)));
+        sums[r][p] = __hfma2(xp, wd[p], sums[r][p]);
+      }
+    }
+  }
+  for (int r = 0; r < NR; ++r) {
+    float s = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+      s += __bfloat162float(__low2bfloat16(sums[r][i]));
+      s += __bfloat162float(__high2bfloat16(sums[r][i]));
+    }
+    for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+    if (lane == 0) out[(long)r * N + row] = __float2bfloat16(s);
+  }
+"""
+QMV_RPB = 4     # output rows a block, the fastest of 4, 8 and 16 measured; no bit depends on it
+
+
+def qmv_fits(x, w, scales, group_size, bits, mode, biases):
+    """x [..., T, K] bf16 times a 4-bit affine bf16-scaled weight that qmv_rows() serves (K a multiple of 16 and of G)."""
+    k = x.shape[-1]
+    return (bits == 4 and mode == "affine" and biases is not None and x.dtype == mx.bfloat16
+            and scales.dtype == mx.bfloat16 and biases.dtype == mx.bfloat16 and w.dtype == mx.uint32
+            and k % 16 == 0 and k % group_size == 0 and group_size % 16 == 0 and w.shape[-1] * 8 == k
+            and w.ndim == 2)
+
+
+def qmv_rows(x, w, scales, biases, group_size):
+    """mx.quantized_matmul(x, w, scales, biases, transpose=True, group_size, bits=4) for x [..., T, K] bf16, each row
+    bit-equal to the one-row call, the weights read once for all rows."""
+    key = (x.shape, w.shape[0], group_size)
+    call = _QMV_CALLS.get(key)
+    if call is None:
+        # the launch's arguments by shape, made once: a verify pass makes ~300 of these calls on the host's critical path
+        if "qmv" not in _KERNELS:
+            _KERNELS["qmv"] = mx.fast.cuda_kernel(
+                name="rows_qmv4", input_names=["x", "w", "scales", "biases"], output_names=["out"], source=_SRC_QMV,
+                header="#include <cuda_bf16.h>\n")
+        n = w.shape[0]
+        call = _QMV_CALLS[key] = dict(
+            template=[("NR", x.size // x.shape[-1]), ("G", group_size), ("RPB", QMV_RPB)],
+            grid=(-(-n // QMV_RPB) * 32 * QMV_RPB, 1, 1), threadgroup=(32 * QMV_RPB, 1, 1),
+            output_shapes=[x.shape[:-1] + (n,)], output_dtypes=[mx.bfloat16])
+    return _KERNELS["qmv"](inputs=[x, w, scales, biases], **call)[0]
+
+
+_QMV_CALLS = {}
+
+
+# MOE_CUDA_ROWS: RoPE of T positions, each with the source lines of MLX 0.32.4's rope_single (rope.cu), the kernel a
+# row-contiguous decode row takes. Its several-position kernel rounds otherwise now and then (197 of 24,576 query rows).
+_SRC_ROPE = """
+  const uint32_t px = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (px >= HALF || r >= ROWS) return;
+  const T* in = x + (long)r * D;
+  T* o = out + (long)r * D;
+  for (uint32_t c = 2 * HALF + px; c < D; c += HALF) o[c] = in[c];
+  float d = static_cast<float>(px) / static_cast<float>(HALF);
+  float inv_freq = exp2(-d * base[0]);
+  float L = scale[0] * static_cast<float>(offset[0] + static_cast<int>(r % NR));
+  float theta = L * inv_freq;
+  float costheta = cos(theta);
+  float sintheta = sin(theta);
+  float x1 = static_cast<float>(in[px]);
+  float x2 = static_cast<float>(in[px + HALF]);
+  float rx1 = x1 * costheta - x2 * sintheta;
+  float rx2 = x1 * sintheta + x2 * costheta;
+  o[px] = static_cast<T>(rx1);
+  o[px + HALF] = static_cast<T>(rx2);
+"""
+_LOG2F = []
+
+
+def rope_rows(x, dims, base, scale, offset):
+    """mx.fast.rope(x, dims, traditional=False, base=base, scale=scale, offset=offset) for x [1, H, T, D], each position
+    with the bits of the one-position call (offset + t)."""
+    if not _LOG2F:
+        import ctypes
+        f = ctypes.CDLL("libm.so.6").log2f      # std::log2(float), as rope.cu passes log2(base) from the host
+        f.restype, f.argtypes = ctypes.c_float, [ctypes.c_float]
+        _LOG2F.append(f)
+    k = _KERNELS.get("rope")
+    if k is None:
+        k = _KERNELS["rope"] = mx.fast.cuda_kernel(name="rows_rope", input_names=["x", "offset", "base", "scale"],
+                                                  output_names=["out"], source=_SRC_ROPE)
+    _, h, t, d = x.shape
+    half = dims // 2
+    lb = _scalar(_LOG2F[0](float(base)), mx.float32)
+    off = offset if isinstance(offset, mx.array) else mx.array(offset, dtype=mx.int32)
+    return k(inputs=[x, off.astype(mx.int32), lb, _scalar(float(scale), mx.float32)],
+             template=[("T", x.dtype), ("NR", t), ("HALF", half), ("D", d), ("ROWS", h * t)],
+             grid=(-(-half // 32) * 32, -(-h * t // 8) * 8, 1), threadgroup=(32, 8, 1), output_shapes=[x.shape],
+             output_dtypes=[x.dtype])[0]

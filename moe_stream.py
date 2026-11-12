@@ -123,6 +123,36 @@ class ForcedPolicy:
         return not spread or gap / spread >= self.EVERY_MAX ** 0.5
 
 
+class LeadPolicy(ForcedPolicy):
+    """MOE_SPEC_AHEAD's arm choice (CUDA): every arm once, plain first, then the fastest by its turns' mean; the arm in
+    use changes only when another beats it by more than the arms' pooled spread, and a slower arm is re-probed on
+    ForcedPolicy's schedule, so a head server does not run plain on every other turn."""
+
+    def pick(self):
+        counts = {a: len(self.ms[a]) for a in self.arms}
+        new = [a for a in self.arms if not counts[a]]
+        if new:
+            return "plain" if "plain" in new else new[0]
+        means = {a: statistics.fmean(self.ms[a]) for a in self.arms}
+        vs = [statistics.variance(self.ms[a]) for a in self.arms if counts[a] > 1]
+        spread = statistics.fmean(vs) ** 0.5 if vs else 0.0
+        best = min(means, key=means.get)
+        if self.best in means and means[self.best] - means[best] <= spread:
+            best = self.best        # hysteresis: within the spread the arm in use stays
+        every = {a: min(self.EVERY_MAX, max(1.0, (abs(means[a] - means[best]) / spread) ** 2
+                                            if spread else float(self.EVERY_MAX)))
+                 for a in self.arms if a != best}
+        if best != self.best:
+            self.best = best
+            self.history.append((self.turn, best, {a: round(m, 1) for a, m in means.items()}))
+            note(f"  decode arm: {best} runs, " + ", ".join(f"{a} {means[a]:.1f}" for a in self.arms)
+                 + " ms/token, re-probed every " + ", ".join(f"{a} {every[a]:.0f}" for a in every) + " turns",
+                 flush=True)
+        due = [(self.turn - self.last[a] - every[a], a) for a in every]
+        due = [(over, a) for over, a in due if over >= 0]
+        return max(due)[1] if due and self.last[best] == self.turn else best
+
+
 class StreamingLLM:
     """A MoE model whose experts are read from SSD as the router asks for them, with
     cache_bias, the arena and the prefill budget as its measured working point."""
@@ -451,6 +481,8 @@ class StreamingLLM:
         # always acts on an exact cache.
         if mtp:
             self._spec = self._load_speculator(mtp)
+            # MOE_SPEC_AHEAD: the head's rounds are warmed after the first turn (_warm_spec).
+            self._spec_cold = self._spec if spec.Speculator.ahead else None
         # Last: its hooks go on top of every wrapper install() put on the
         # layer stack, and only once an image comes.
         self._vision, self._vision_why = vision.attach(
@@ -524,6 +556,25 @@ class StreamingLLM:
         note(f"  mtp head {f}: {f.stat().st_size / 1e6:.1f} MB loaded, "
               f"speculative decode on")
         return spec.Speculator(self.model, head)
+
+    def _warm_spec(self, sp):
+        """MOE_SPEC_AHEAD: a short speculative decode on a cache of its own after the first turn, so a verify pass's
+        first-use kernel builds stay out of the MTP turns the decode policy times."""
+        t = time.perf_counter()
+        ids = list(self._seen[-16:])        # the first turn's own ids
+        # Out of the memory budget's sight: it keeps the largest prefill growth a position it measures.
+        stack = stream_fast._layer_stack_of(self.model)
+        bud = stack.__dict__.pop("_mem_budget", None)
+        try:
+            for _ in sp.generate(ids, 24):
+                pass
+            mx.synchronize()
+        finally:
+            if bud is not None:
+                stack.__dict__["_mem_budget"] = bud
+            mx.clear_cache()
+            mx.reset_peak_memory()
+        note(f"  mtp: speculative rounds warmed in {time.perf_counter() - t:.1f} s")
 
     def _learn_stub(self):
         """The stub's text and its exact token ids, read out of the template: what only the
@@ -1314,7 +1365,9 @@ class StreamingLLM:
                 decode_policy = self.decode_policy_call
             else:
                 if self.decode_policy_free is None:
-                    self.decode_policy_free = ForcedPolicy((lead, "plain"))
+                    # MOE_SPEC_AHEAD (CUDA) runs these MTP turns, and LeadPolicy chooses for them.
+                    pol = LeadPolicy if lead == "mtp" and spec.Speculator.ahead else ForcedPolicy
+                    self.decode_policy_free = pol((lead, "plain"))
                 decode_policy = self.decode_policy_free
             decode_arm = decode_policy.pick()
             if decode_arm == "plain":
@@ -1631,6 +1684,11 @@ class StreamingLLM:
         # dropped first so its logprobs are not freed into the cache on return.
         del resp
         mx.clear_cache()
+        if self._spec_cold is not None:
+            sp, self._spec_cold = self._spec_cold, None
+            self._warm_spec(sp)
+
+    _spec_cold = None
 
     def ask(self, message=None, messages=None, max_tokens=None, resume=None,
             tools=None, response_format=None, sampling=None):

@@ -12,6 +12,7 @@ import machine
 
 HOME = Path.home()                       # tests point this at a made-up home
 SCAN_TTL = 3600                          # seconds a scan stays good; `r` and --rescan look again
+SCAN_VERSION = 3                         # bumped when a copy's fields change, so an older cache is read again
 UNFINISHED = (".pack_state.json", ".exl3_state.json", ".requant_state.json")
 SKIP_CACHE = ("moe-ssd-offload", "huggingface")
 WHERE_ORDER = {"models": 3, "cache": 2, "hf": 1, "volume": 0}      # the copy to prefer when two match
@@ -21,10 +22,25 @@ VOLUMES = defaults.VOLUMES
 
 # ---------------------------------------------------------------- what a folder is
 
+def _index_format(path):
+    """"gguf" when the folder's experts_index.json holds GGUF block records, else None."""
+    try:
+        idx = json.loads((Path(path) / "experts_index.json").read_text())
+        return "gguf" if next(iter(idx.values()))["parts"][0]["name"] == "gguf" else None
+    except (OSError, ValueError, StopIteration, KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+
+def sig_format(sig):
+    """A signature's expert format: "exl3", "gguf" or None (one stored before the field knew EXL3 only)."""
+    return sig.get("format", "exl3" if sig.get("exl3") else None)
+
+
 def signature(path):
     """The model a folder holds, read from its config.json: type, layers, hidden size, experts,
-    the experts' bits (the commonest per-module entry, else the model's) and whether they are
-    EXL3; None without a readable config."""
+    the experts' bits (the commonest per-module entry, else the model's) and their format (EXL3
+    or GGUF from config.json's expert_quant, GGUF also from the experts' index); None without a
+    readable config."""
     try:
         cfg = json.loads((Path(path) / "config.json").read_text())
     except (OSError, ValueError):
@@ -42,6 +58,7 @@ def signature(path):
 
     q = cfg.get("quantization") or text.get("quantization") or {}
     eq = cfg.get("expert_quant") or {}
+    fmt = eq.get("format", "exl3") if eq else _index_format(path)
     per = [v["bits"] for k, v in q.items() if isinstance(v, dict) and "switch_mlp" in k and v.get("bits")]
     if eq:
         bits = eq.get("k") or eq.get("bits")
@@ -53,12 +70,12 @@ def signature(path):
             "layers": get("num_hidden_layers", "num_layers", "n_layer"),
             "hidden": get("hidden_size", "d_model", "n_embd"),
             "experts": get("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts") or 0,
-            "bits": bits, "exl3": bool(eq)}
+            "bits": bits, "exl3": fmt == "exl3", "format": fmt}
 
 
 def matches(sig, facts, size=0):
     """Whether a folder with this signature is the model whose catalog facts these are: the same
-    type, layers, hidden size and experts, and the same bits (EXL3 only with EXL3)."""
+    type, layers, hidden size and experts, and the same bits and expert format (EXL3, GGUF or MLX)."""
     if not sig or not facts:
         return False
     if facts.get("model_type") != sig["model_type"] or facts.get("layers") != sig["layers"]:
@@ -70,8 +87,10 @@ def matches(sig, facts, size=0):
         return False                     # a dense entry without a hidden size: the weights' size decides
     if facts.get("experts") and sig["experts"] != facts["experts"]:
         return False
-    if (facts.get("format") == "exl3") != sig["exl3"]:
+    if facts.get("format") != sig_format(sig):
         return False
+    if sig_format(sig) == "gguf":              # a GGUF pack says its bits or is nobody's (a hand-made one)
+        return sig["bits"] == facts.get("bits")
     return sig["bits"] in (None, facts.get("bits"))
 
 
@@ -105,6 +124,30 @@ def roots(models, others, deep=True):
     return out
 
 
+def front_matter(p):
+    """The `base_model` names (lower case list) and the `base_model_relation` from the folder's README.md front matter; empty without one."""
+    try:
+        lines = (Path(p) / "README.md").read_text(errors="replace").splitlines()
+    except OSError:
+        return [], ""
+    if not lines or lines[0].strip() != "---":
+        return [], ""
+    bases, rel, key = [], "", None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if line.startswith("- ") and key == "base_model":
+            bases.append(line[2:].strip().strip("'\""))
+        elif ":" in line and not line.startswith((" ", "-")):
+            key, _, val = line.partition(":")
+            key, val = key.strip(), val.strip().strip("'\"")
+            if key == "base_model" and val:
+                bases.append(val)
+            elif key == "base_model_relation":
+                rel = val.lower()
+    return [b.lower() for b in bases], rel
+
+
 def read_folder(where, p):
     """The facts of one candidate folder, or None for a folder that is unfinished, made by the
     launcher from another (it has its own entry), or holds no weights."""
@@ -127,7 +170,9 @@ def read_folder(where, p):
     except (OSError, ValueError, AttributeError):
         made = ""
     size = sum(f.stat().st_size for f in os.scandir(p) if f.is_file())
-    return {"path": str(p), "where": where, "repo": repo, "id": made, "sig": sig, "packed": packed, "size": size}
+    bases, relation = front_matter(p)
+    return {"path": str(p), "where": where, "repo": repo, "id": made, "sig": sig, "packed": packed, "size": size,
+            "base_model": bases, "relation": relation}
 
 
 def _walk(parent, skip=()):
@@ -154,7 +199,7 @@ def scan(models, refresh=False):
         old = json.loads(cache_path().read_text())
     except (OSError, ValueError):
         old = {}
-    if not refresh and old.get("roots") == key and time.time() - old.get("at", 0) < SCAN_TTL:
+    if not refresh and old.get("v") == SCAN_VERSION and old.get("roots") == key and time.time() - old.get("at", 0) < SCAN_TTL:
         return [c for c in old.get("folders", []) if Path(c["path"]).is_dir()]
     out = []
     for w, parent in roots(models, others):
@@ -168,7 +213,7 @@ def scan(models, refresh=False):
                 out.append(c)
     try:
         machine.CACHE.mkdir(parents=True, exist_ok=True)
-        cache_path().write_text(json.dumps({"at": time.time(), "roots": key, "folders": out}))
+        cache_path().write_text(json.dumps({"v": SCAN_VERSION, "at": time.time(), "roots": key, "folders": out}))
     except OSError:
         pass
     return out
@@ -190,7 +235,13 @@ def find(copies, e):
             continue
         if f.get("format") == "exl3" and not c["packed"]:
             continue                     # the experts' own repo holds no dense part to run
+        base = (e.get("base") or "").lower()
+        names = c.get("base_model") or []
+        if base and (names and not ({base, (e.get("repo") or "").lower()} - {""}) & set(names)
+                     or c.get("relation") in ("finetune", "adapter", "merge")):
+            continue                     # its card says it is another model on the same architecture
         rank = (c["packed"] or f.get("kind") != "moe",
+                bool(base and names),
                 bool(c["repo"] and c["repo"] == e.get("repo")) or (bool(c["id"]) and c["id"] == e.get("id")),
                 WHERE_ORDER.get(c["where"], 0))
         if best is None or rank > best[0]:
@@ -300,7 +351,7 @@ def folder_key(path, sig):
     if not sig:
         return name
     return "{}@{}/{}/{}/{}/{}{}".format(name, sig["model_type"], sig["layers"], sig["hidden"], sig["experts"],
-                                        sig["bits"], "x" if sig["exl3"] else "")
+                                        sig["bits"], {"exl3": "x", "gguf": "g"}.get(sig_format(sig), ""))
 
 
 def record(model_path, tokens, decode_s, fp=None, today=None):

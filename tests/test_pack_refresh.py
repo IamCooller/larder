@@ -20,6 +20,8 @@ with tempfile.TemporaryDirectory() as d:
     f.write_bytes(os.urandom(5 * (1 << 20) + 1234))      # an unaligned tail on purpose
     h = sha(f)
     ch = 1 << 20
+    # Other jobs writing to this disk would trip the free-space rule, which this test does not cover.
+    pack_refresh.free_jitter = lambda p: (0, 0)
     assert pack_refresh.rewrite(f, prog, chunk=ch, log=lambda *_: None) == "done" and sha(f) == h and not prog.exists()
     # A stop after two chunks: progress says 2 MB done, and the next run starts there.
     prog.write_text(json.dumps({"path": str(f), "size": f.stat().st_size, "done": 2 * ch}))

@@ -1135,6 +1135,330 @@ def check_mtp_head(tmp):
           "model's config by the pack's shapes; without one the plan says what it would add and how to make it")
 
 
+Q36 = {"kind": "moe", "model_type": "qwen3_5_moe", "layers": 40, "hidden": 2048, "d_ff": 512, "moe_layers": 40,
+       "experts": 256, "top_k": 8, "expert_bytes": 1769472, "bits": 4, "group": 64, "dense_bytes": 1.1033e9,
+       "read_bytes": 1.1033e9, "total_bytes": 20e9, "embed_bytes": 0}
+
+
+def check_cuda_q40(tmp):
+    """On CUDA the curated 35B installs as the fast recipe (the base's trunk, a pinned Q4_0 GGUF's experts, the
+    model's own MTP head) with the 4-bit pack kept as a variant; on Metal the entry is the one it was."""
+    import types
+    import huggingface_hub
+    import library
+    cur = launch.CURATED[0]
+    assert launch.for_backend(cur, "metal") is cur and "gguf" not in launch.for_backend(cur, "metal")
+    c = launch.for_backend(cur, "cuda")
+    assert c["id"] == "qwen3.6-35b-q40" and c["repo"] == cur["repo"] and c["gated"] and c["native"]
+    assert c["gguf"]["file"] == "Qwen_Qwen3.6-35B-A3B-Q4_0.gguf" and len(c["gguf"]["rev"]) == 40
+
+    # sizes from the API's file list alone: four shards of the 4-bit repo, the GGUF and the head from the entry
+    shards = [5.3e9, 5.3e9, 5.3e9, 4.5e9]
+    info = types.SimpleNamespace(sha="r", siblings=[types.SimpleNamespace(rfilename=f"model-{i}.safetensors", size=int(s))
+                                                    for i, s in enumerate(shards)])
+    saved = huggingface_hub.HfApi, launch._hf_json, launch.inspect_model
+    huggingface_hub.HfApi = lambda: types.SimpleNamespace(model_info=lambda *a, **k: info)
+    launch._hf_json, launch.inspect_model = lambda *a: {}, lambda cfg, names=None: dict(Q36)
+    try:
+        e, m = launch.hf_entry(c), launch.hf_entry(launch.for_backend(cur, "metal"))
+    finally:
+        huggingface_hub.HfApi, launch._hf_json, launch.inspect_model = saved
+    size = sum(int(s) for s in shards)
+    assert m["download"] == m["disk"] == size and "format" not in m["facts"]          # Metal: as published
+    base = size - 1769472 * 256 * 40
+    f = e["facts"]
+    assert f["format"] == "gguf" and f["bits"] == 4.52 and f["expert_bytes"] == 18203279360 // (256 * 40), f
+    assert e["download"] == base + 20836243072 + 1689281536, e["download"]
+    assert e["disk"] == base + 18203279360 + int(1689281536 * 0.5625 / 2) and e["transient"] == 20836243072
+
+    # variants: the recipe first, the 4-bit pack beside it, nothing rounded from GGUF records; an installed
+    # 4-bit folder is the 4-bit variant's and never the recipe's
+    models = tmp / "q40_models"
+    old = fake_folder(models / "qwen3.6-35b", {"model_type": "qwen3_5_moe", "num_hidden_layers": 40, "hidden_size": 2048,
+                                                "num_experts": 256, "quantization": {"group_size": 64, "bits": 4}},
+                      packed=True, extra=["launcher.json"])
+    sib = {**{k: c[k] for k in ("repo", "rev", "recipe", "gated", "native")}, "id": "mlx-community--Qwen3.6-35B-A3B-4bit",
+           "name": "Qwen3.6-35B-A3B-4bit", "facts": dict(Q36), "download": size, "disk": size, "transient": 0}
+    library.scan(models, refresh=True)
+    vs = launch.variants(e, models, [sib])
+    assert [v["key"] for v in vs] == ["published", "mlx-community/Qwen3.6-35B-A3B-4bit"], vs
+    assert vs[0]["label"] == "as published, GGUF Q4_0, Q4_1 experts" and "166 tok/s" in vs[0]["note"]
+    assert "measured against" in vs[1]["note"] and "path" not in vs[0]["entry"]
+    assert vs[1]["entry"]["path"] == str(old), vs[1]["entry"].get("path")
+    assert launch.model_dir(vs[0]["entry"], models) == models / "qwen3.6-35b-q40"
+
+    # folder identity by the real signature: a GGUF pack (by its config, or by its index alone) is never the
+    # 4-bit pack, a 4-bit pack never the recipe, and the recipe's own folder is the recipe's
+    m2 = tmp / "q40_ident"
+    m2.mkdir()
+    cfg4 = json.loads((old / "config.json").read_text())
+    fast = fake_folder(m2 / "fast", dict(cfg4, expert_quant={"format": "gguf", "bits": 4.52, "source": "s"}), packed=True)
+    hand = fake_folder(m2 / "hand", cfg4, packed=True)
+    (hand / "experts_index.json").write_text(json.dumps({"model.layers.0.mlp.switch_mlp.gate_proj":
+                                                         {"parts": [{"name": "gguf", "ggml_type": "Q4_0"}]}}))
+    linked = fake_folder(m2 / "linked", dict(cfg4, expert_quant={"format": "gguf", "source": "s", "types": ["Q4_0"]}),
+                         packed=True)                       # a hand-made GGUF pack's marker, with no bits
+    sf, sh, so, sl = (library.signature(p) for p in (fast, hand, old, linked))
+    assert (sf["format"], sf["bits"], sh["format"], so["format"]) == ("gguf", 4.52, "gguf", None), (sf, sh, so)
+    assert library.matches(sf, e["facts"]) and not library.matches(sf, Q36)
+    assert not library.matches(sh, Q36) and not library.matches(so, e["facts"])
+    assert sl["format"] == "gguf" and not library.matches(sl, Q36) and not library.matches(sl, e["facts"])
+    assert library.folder_key(fast, sf).endswith("/4.52g") and library.folder_key(old, so).endswith("/4")
+    library.scan(m2, refresh=True)
+    assert library.adopt(e, m2)["path"] == str(fast) and "path" not in library.adopt(sib, m2)
+    shutil.rmtree(fast)
+    library.scan(m2, refresh=True)
+    assert "path" not in library.adopt(e, m2)
+
+    # --model takes the listed id and the CUDA one on CUDA, the listed one only on Metal
+    real_hf = launch.hf_entry
+    launch.hf_entry = lambda x: {**x, "facts": dict(Q36, format="gguf") if x.get("gguf") else dict(Q36),
+                                 "download": 1, "disk": 1, "transient": 0}
+    try:
+        for name in ("qwen3.6-35b", "qwen3.6-35b-q40"):
+            args = types.SimpleNamespace(model=name, variant="published")
+            assert launch.pick(args, prof("cuda", gpu_mem=17.1), models, None)["id"] == "qwen3.6-35b-q40"
+        assert launch.pick(types.SimpleNamespace(model="qwen3.6-35b", variant="published"), prof(), models,
+                           None)["id"] == "qwen3.6-35b"
+        try:
+            launch.pick(types.SimpleNamespace(model="qwen3.6-35b-q40", variant="published"), prof(), models, None)
+            raise AssertionError("the CUDA id taken on Metal")
+        except SystemExit as err:
+            assert "not a listed id (qwen3.6-35b, flash-next-exl3" in str(err), err
+    finally:
+        launch.hf_entry = real_hf
+
+    # the install: trunk aside by stream_pack, the GGUF into the folder, repacked and deleted, the head packed
+    calls, fail = [], {"repack": True}
+    big = {"repo": e["repo"], "file": c["gguf"]["file"]}
+
+    def fake_run(cmd):
+        tool = Path(cmd[1]).name
+        calls.append(tool)
+        out = Path(cmd[cmd.index("--out") + 1])
+        if tool == "stream_pack.py":
+            assert cmd[-1] == "--skip-experts" and out.name == "_trunk"
+            out.mkdir(parents=True)
+            (out / "config.json").write_text(json.dumps({"model_type": "qwen3_5_moe"}))
+            (out / "model-00001-of-00001.safetensors").write_bytes(b"t")
+            (out / "experts.bin").write_bytes(b"")
+            (out / "experts_index.json").write_text("{}")
+        elif tool == "gguf_repack.py":
+            assert Path(cmd[2]).name == big["file"] and cmd[-2:] == ["--layers", "40"] and out.name == "experts.bin"
+            if fail["repack"]:
+                fail["repack"] = False
+                raise SystemExit("stopped")
+            out.write_bytes(b"g" * 64)
+            out.with_name("experts_index.json").write_text(json.dumps({"k": {"parts": [{"name": "gguf"}]}}))
+        elif tool == "mtp_pack.py":
+            assert (Path(cmd[cmd.index("--src") + 1]) / "mtp.safetensors").read_bytes() == b"head"
+            out.write_bytes(b"h")
+            out.with_name(out.stem + "-quant.json").write_text("{}")
+
+    def fake_download(repo, name, revision=None, local_dir=None):
+        assert (repo, name, revision) == (c["gguf"]["repo"], big["file"], c["gguf"]["rev"])
+        calls.append("download")
+        p = Path(local_dir) / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"GGUF")
+        return str(p)
+
+    def fake_fetch(repo, rev, dst):
+        assert (repo, rev) == (c["mtp"]["repo"], c["mtp"]["rev"])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"head")
+
+    saved = launch._run, huggingface_hub.hf_hub_download, launch._fetch_mtp, launch.tuner.record_baseline
+    launch._run, huggingface_hub.hf_hub_download, launch._fetch_mtp = fake_run, fake_download, fake_fetch
+    launch.tuner.record_baseline = lambda *a: None
+    try:
+        e = vs[0]["entry"]
+        try:
+            launch.prepare(e, models)
+            raise AssertionError("the stopped repack went on")
+        except SystemExit:
+            pass
+        d = models / "qwen3.6-35b-q40"
+        assert calls == ["stream_pack.py", "download", "gguf_repack.py"] and not launch.is_ready(d)
+        assert launch.prepare(e, models) == d                 # resumes: no second trunk
+        assert calls[3:] == ["download", "gguf_repack.py", "mtp_pack.py"], calls
+        assert sorted(p.name for p in d.iterdir()) == ["config.json", "experts.bin", "experts_index.json",
+                                                       "launcher.json", "model-00001-of-00001.safetensors",
+                                                       "mtp-4bit-quant.json", "mtp-4bit.safetensors"]
+        assert json.loads((d / "config.json").read_text())["expert_quant"]["format"] == "gguf"
+        assert (old / "launcher.json").exists() and (old / "experts.bin").stat().st_size == 5000   # the 4-bit pack kept
+        # finished experts already in an empty folder (another pack's, linked in) are kept: trunk and head only
+        d2 = models / "linked"
+        d2.mkdir()
+        os.link(d / "experts.bin", d2 / "experts.bin")
+        shutil.copy(d / "experts_index.json", d2)
+        del calls[:]
+        launch._pack_gguf(e, d2)
+        assert calls == ["stream_pack.py", "mtp_pack.py"] and (d / "experts.bin").read_bytes() == b"g" * 64
+    finally:
+        launch._run, huggingface_hub.hf_hub_download, launch._fetch_mtp, launch.tuner.record_baseline = saved
+
+    # the recipe's command: the CUDA store flags, the gated cache bias and the head beside the model
+    real_mtp = launch.mtp_for
+    hidden = lambda cfg: types.SimpleNamespace(hidden_size=2048)
+    launch.mtp_for = lambda d, e, mod=None: real_mtp(d, e, mod=types.SimpleNamespace(head_args=hidden, DEFAULT_MTP=None))
+    hdr = json.dumps({"mtp.fc.weight": {"dtype": "U8", "shape": [2048, 4096], "data_offsets": [0, 0]}}).encode()
+    (d / launch.MTP_PACK).write_bytes(len(hdr).to_bytes(8, "little") + hdr)
+    try:
+        s, est = launch.engine_plan(e, prof("cuda", ram=15, gpu_mem=17.1, avail=12.0), {"gbps": 6.0, "lat_ms": 0.1}, d=d)
+        (d / "mtp-4bit-quant.json").unlink()
+        bare, _ = launch.engine_plan(e, prof("cuda", ram=15, gpu_mem=17.1, avail=12.0), {"gbps": 6.0, "lat_ms": 0.1}, d=d)
+    finally:
+        launch.mtp_for = real_mtp
+    assert s["args"][-6:] == ["--cache-bias", "0.5", "--bias-budget", "0.2", "--mtp", str(d / launch.MTP_PACK)], s["args"]
+    assert s["env"]["ENGINE_BIAS_GATED"] == "1" and s["env"]["MOE_RESIDENT"] == "1" and est["tps"] > 0, s["env"]
+    assert "--mtp" not in bare["args"]
+
+    # --delete on CUDA: either id names the recipe's folder; the 4-bit key the 4-bit pack where it was found;
+    # the question always names the folder that goes
+    import argparse
+    asked, answer = [], {"a": "no"}
+    saved = (machine.facts, launch.ask, launch.running_models, launch.hf_entry, launch.siblings)
+    machine.facts = lambda: {"backend": "cuda"}
+    launch.ask = lambda prompt, default="": asked.append(prompt) or answer["a"]
+    launch.running_models, launch.siblings = lambda: set(), lambda x, limit=4: [sib]
+    launch.hf_entry = lambda x: {**x, "facts": e["facts"], "download": 1, "disk": 1, "transient": 0}
+    ns = lambda i, v: argparse.Namespace(delete=i, variant=v, yes=False, models_dir=str(models))
+    try:
+        for i in ("qwen3.6-35b", "qwen3.6-35b-q40"):
+            assert launch.delete_cli(ns(i, "mlx-community/Qwen3.6-35B-A3B-4bit")) == 1
+            assert asked.pop().startswith(f"Delete {i} mlx-community/Qwen3.6-35B-A3B-4bit at {old} (")
+            assert launch.delete_cli(ns(i, "published")) == 1 and asked.pop().startswith(f"Delete {i} published at {d} (")
+        assert old.exists() and d.exists()
+        answer["a"] = "yes"
+        assert launch.delete_cli(ns("qwen3.6-35b-q40", "published")) == 0 and not d.exists() and old.exists()
+        machine.facts = lambda: {"backend": "metal"}
+        assert launch.delete_cli(ns("qwen3.6-35b", "published")) == 0 and not old.exists()   # Metal: the listed folder
+    finally:
+        machine.facts, launch.ask, launch.running_models, launch.hf_entry, launch.siblings = saved
+
+    # the head's tensors range-read from the checkpoint's shards into one file, bit for bit
+    w1 = {"mtp.fc.weight": mx.arange(12, dtype=mx.bfloat16).reshape(3, 4), "model.x": mx.ones((5,))}
+    w2 = {"mtp.norm.weight": mx.full((7,), 2.5), "lm_head.weight": mx.zeros((2, 2))}
+    rd = tmp / "fake_repo"
+    rd.mkdir()
+    for n, w in (("a.safetensors", w1), ("b.safetensors", w2)):
+        mx.save_safetensors(str(rd / n), w)
+    (rd / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {**{k: "a.safetensors" for k in w1}, **{k: "b.safetensors" for k in w2}}}))
+    fs = types.SimpleNamespace(read_text=lambda p, revision=None: (rd / Path(p).name).read_text(),
+                               open=lambda p, mode="rb", revision=None: open(rd / Path(p).name, mode))
+    launch._fetch_mtp("o/r", "x", tmp / "head" / "mtp.safetensors", fs=fs)
+    got = mx.load(str(tmp / "head" / "mtp.safetensors"))
+    assert sorted(got) == ["mtp.fc.weight", "mtp.norm.weight"]
+    assert mx.array_equal(got["mtp.fc.weight"], w1["mtp.fc.weight"]) and mx.array_equal(got["mtp.norm.weight"], w2["mtp.norm.weight"])
+    print("23. CUDA 35B: the Q4_0 GGUF recipe (pinned GGUF, sizes, install steps that resume, head packed, --mtp), "
+          "the 4-bit pack kept as a variant; Metal unchanged")
+
+
+def check_cuda_serve_exec(tmp):
+    """On CUDA a start that imported MLX (128 MiB of VRAM in a CUDA context) serves from a fresh process: the plan
+    goes to a file and the launcher execs itself with --serve; on Metal it serves in place, as before."""
+    import types
+    models = tmp / "exec_models"
+    d = fake_folder(models / "m", {"model_type": "x"}, extra=["launcher.json"])
+    e = entry(Q15, id="m", name="M")
+    s, est = {"args": ["--cache-bias", "0.5"], "env": {"MOE_NATIVE": "1"}, "why": [], "mtp": {"path": ""}}, {"tps": 9.0}
+    calls = {}
+
+    class Exec(Exception):
+        pass
+
+    def fake_exec(py, argv):
+        calls["argv"] = argv
+        raise Exec()
+    saved = (machine.profile, machine.ssd, launch.pick, launch.judge, launch.engine_plan, launch.serve, os.execv, sys.argv)
+    machine.ssd = lambda *a, **k: {"gbps": 5.0, "lat_ms": 0.1}
+    launch.pick, launch.judge = lambda *a: e, lambda *a: {"ok": True}
+    launch.engine_plan = lambda *a, **k: (s, est)
+    launch.serve = lambda *a: calls.setdefault("serve", a)
+    os.execv = fake_exec
+    try:
+        for backend in ("metal", "cuda"):
+            calls.clear()
+            machine.profile = lambda **k: {**prof(backend), "chip": "c", "arch": "a", "os": "o", "gpu": "g", "now": {"avail_gb": 14.0, "disks": []}}
+            sys.argv = ["launch.py", "--model", "m", "--models-dir", str(models), "--no-browser", "--no-chat"]
+            try:
+                launch.main()
+            except Exec:
+                pass
+            if backend == "metal":
+                assert "argv" not in calls and calls["serve"][1:] == (e, d, s, est, "published", False), calls
+        argv = calls["argv"]
+        assert "serve" not in calls and argv[1].endswith("launch.py") and argv[2:-2] == sys.argv[1:] and argv[-2] == "--serve"
+        plan = json.loads(Path(argv[-1]).read_text())
+        assert (plan["e"]["id"], plan["d"], plan["s"], plan["est"]) == ("m", str(d), s, est)
+        assert plan["fp"] == machine.fingerprint()
+        calls.clear()
+        sys.argv = ["launch.py", "--serve", argv[-1]]
+        launch.main()                              # the fresh process: straight to serving, the plan file read once
+        assert calls["serve"][1:] == (plan["e"], d, s, est, "published", False) and not Path(argv[-1]).exists()
+        real_facts = machine.facts                 # its key comes from the plan: facts (and MLX) are never read
+        machine.facts = lambda: (_ for _ in ()).throw(AssertionError("facts read in the served process"))
+        assert machine.KEY == [plan["fp"]] and machine.fingerprint() == plan["fp"]
+        machine.facts = real_facts
+    finally:
+        machine.KEY[:] = []
+        machine.profile, machine.ssd, launch.pick, launch.judge, launch.engine_plan, launch.serve, os.execv, sys.argv = saved
+    print("25. CUDA start serves from a fresh process (exec with --serve and the plan), so the launcher holds no "
+          "CUDA context beside its server; Metal serves in place")
+
+
+def check_exl3_resume(tmp, src):
+    """An EXL3 install stopped after its first experts shard resumes into the same experts.bin: the rerun
+    neither makes the trunk again (stream_pack would truncate experts.bin) nor pads it with zeros."""
+    import huggingface_hub
+    import repack
+    models = tmp / "exl3_resume"
+    e = {"id": "x3", "name": "X3", "repo": "o/X-4bit", "rev": "r", "facts": {"kind": "moe"}, "experts_repo": "o/X-exl3",
+         "experts_rev": "x", "exl3_files": ["L0.safetensors", "L1.safetensors"], "expert_quant": {"format": "exl3", "k": 3},
+         "disk": 1, "download": 1, "transient": 0}
+    calls, stop = [], {"L1.safetensors": True}
+
+    def fake_run(cmd):
+        calls.append(Path(cmd[1]).name)
+        i = cmd.index("--repo")
+        r = subprocess.run([*cmd[:i], "--from-dir", str(src), *cmd[i + 4:]], cwd=ROOT, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    def fake_download(repo, name, revision=None, local_dir=None):
+        if stop.pop(name, False):
+            raise OSError("the network went away")
+        p = Path(local_dir) / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(name[:2].encode() * 50)
+        return str(p)
+
+    def fake_pack(p, dst, written, index):
+        dst.write(Path(p).read_bytes())
+        index[Path(p).name] = written
+        return written + Path(p).stat().st_size
+
+    saved = launch._run, huggingface_hub.hf_hub_download, repack.pack_shard, launch.tuner.record_baseline
+    launch._run, huggingface_hub.hf_hub_download, repack.pack_shard = fake_run, fake_download, fake_pack
+    launch.tuner.record_baseline = lambda *a: None
+    try:
+        try:
+            launch.prepare(e, models)
+            raise AssertionError("the stopped download went on")
+        except OSError:
+            pass
+        d = models / "x3"
+        assert (d / "experts.bin").read_bytes() == b"L0" * 50
+        launch.prepare(e, models)
+    finally:
+        launch._run, huggingface_hub.hf_hub_download, repack.pack_shard, launch.tuner.record_baseline = saved
+    assert (d / "experts.bin").read_bytes() == b"L0" * 50 + b"L1" * 50, (d / "experts.bin").read_bytes()[:8]
+    assert calls == ["stream_pack.py"] and json.loads((d / "experts_index.json").read_text()) == \
+        {"L0.safetensors": 0, "L1.safetensors": 100}
+    print("24. EXL3 install resumes after a stopped experts shard: the trunk not made again, no zeros in experts.bin")
+
+
 def check_live_speed():
     """The launcher reads the running server's /status: the measured speed over its replies beside the
     estimate it made, and the conditions under it; the same number the web header and the monitor show."""
@@ -1322,6 +1646,60 @@ def check_found_copies(tmp):
     print("19. found copies: an EXL3 pack and a 4-bit pack each match their own variant, on disk at <path> "
           "with no download, a raw snapshot packs in place, half-downloaded and unfinished folders are "
           "skipped, the scan is cached and looks again on refresh")
+
+
+def check_base_model(tmp):
+    """A folder with the curated entry's architecture is that model only when its README does not name
+    another base model; no README is adopted as before; an old scan cache is read again."""
+    import library
+    cfg = {"model_type": "fake_moe", "num_hidden_layers": 24, "hidden_size": 64, "num_experts": 60,
+           "quantization": {"group_size": 64, "bits": 4}}
+    e = entry(dict(Q15, model_type="fake_moe", layers=24, hidden=64), id="q35", repo="owner/Q35-4bit",
+              base="Qwen/Q35")
+
+    def copy(name, readme=None):
+        p = fake_folder(tmp / "bm" / name, cfg)
+        if readme is not None:
+            (p / "README.md").write_text(readme)
+        return library.read_folder("cache", p)
+
+    def card(*lines):
+        return "---\nlicense: apache-2.0\n" + "\n".join(lines) + "\ntags:\n- mlx\n---\n# title\n"
+
+    other = copy("other", card("base_model: InternScience/Sage-A1.5", "base_model_relation: quantized"))
+    same = copy("same", card("base_model: Qwen/Q35"))
+    bare = copy("bare")
+    listed = copy("listed", card("base_model:", "- Some/Other", "- qwen/q35"))
+    tuned = copy("tuned", card("base_model: Qwen/Q35", "base_model_relation: finetune"))
+    assert other["base_model"] == ["internscience/sage-a1.5"] and listed["base_model"] == ["some/other", "qwen/q35"]
+    assert tuned["relation"] == "finetune" and bare["base_model"] == [] and copy("broken", "---\nbase_model")["base_model"] == []
+    assert library.find([other], e) is None                                    # (a) another model
+    assert library.find([same], e) is same                                     # (b) its own base
+    assert library.find([bare], e) is bare                                     # (c) no README
+    assert library.find([listed], e) is listed                                 # (d) the list form
+    assert library.find([tuned], e) is None                                    # (e) a fine-tune
+    assert library.find([bare, same, other], e) is same                        # (f) evidence ranks first
+    assert library.find([other], dict(e, base=None)) is other                  # no base: as before
+    longer = copy("longer", card("base_model: Qwen/Q35-Instruct"))
+    assert library.find([longer], e) is None                                   # a longer name is another model
+    assert library.find([other], dict(e, repo="")) is None                     # no repo: the base alone decides
+    assert library.find([same], dict(e, repo="")) is same
+    real = library.HOME, machine.CACHE
+    library.HOME, machine.CACHE = tmp / "bmhome", tmp / "bmcache"
+    try:
+        models = tmp / "bmmodels"
+        models.mkdir()
+        fake_folder(tmp / "bmhome" / ".cache" / "m", cfg)
+        library.scan(models, refresh=True)
+        old = json.loads(library.cache_path().read_text())
+        old.pop("v")
+        old["folders"] = [{k: v for k, v in c.items() if k not in ("base_model", "relation")} for c in old["folders"]]
+        library.cache_path().write_text(json.dumps(old))
+        assert "base_model" in library.scan(models)[0]                         # (g) an old cache is refreshed
+    finally:
+        library.HOME, machine.CACHE = real
+    print("21. base model: another model on the same architecture is not adopted, no README still is, "
+          "the match ranks first, an old scan cache is refreshed")
 
 
 def check_measured(tmp):
@@ -1652,11 +2030,15 @@ def main():
         check_device_safety(tmp)
         check_disk_short(tmp)
         check_found_copies(tmp)
+        check_base_model(tmp)
         check_measured(tmp)
         check_estimate_learns(tmp)
         check_mtp_head(tmp)
         check_delete(tmp)
         check_search(tmp)
+        check_cuda_q40(tmp)
+        check_exl3_resume(tmp, src)
+        check_cuda_serve_exec(tmp)
         library.HOME, library.volumes, machine.CACHE = real_lib[:3]
         os.environ.pop("HF_HUB_CACHE", None) if real_lib[3] is None else os.environ.__setitem__("HF_HUB_CACHE", real_lib[3])
     check_settings()

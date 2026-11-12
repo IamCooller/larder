@@ -39,11 +39,24 @@ DISK_RESERVE = 10 * GB
 # the model and `native` means the native reader was tested.
 CURATED = [
     {"id": "qwen3.6-35b", "name": "Qwen3.6-35B-A3B", "about": "general chat, code, tool calls",
-     "repo": "mlx-community/Qwen3.6-35B-A3B-4bit", "rev": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
-     "recipe": "arena", "gated": True, "native": True, "license": "apache-2.0"},
+     "repo": "mlx-community/Qwen3.6-35B-A3B-4bit", "base": "Qwen/Qwen3.6-35B-A3B", "rev": "38740b847e4cb78f352aba30aa41c76e08e6eb46",
+     "recipe": "arena", "gated": True, "native": True, "license": "apache-2.0",
+     # On CUDA: the same trunk with a Q4_0 GGUF's routed experts and the model's own MTP head (for_backend).
+     "cuda": {"id": "qwen3.6-35b-q40",
+              "gguf": {"repo": "bartowski/Qwen_Qwen3.6-35B-A3B-GGUF", "file": "Qwen_Qwen3.6-35B-A3B-Q4_0.gguf",
+                       "rev": "5c2410d71524f4f72b023ce8daf7a80528226d5f", "size": 20836243072,
+                       "sha256": "52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e",
+                       "experts_bytes": 18203279360, "types": "Q4_0, Q4_1"},
+              "mtp": {"repo": "Qwen/Qwen3.6-35B-A3B", "rev": "345d467b117d1fd5eda9b879a5988de9ae5f47a7",
+                      "bytes": 1689281536},
+              "notes": {"published": "Q4_0 GGUF experts, cache bias 0.5 and the model's own MTP head, measured "
+                                     "on an RTX 5060 Ti (2026-11-11): 166 tok/s against 41 for the 4-bit pack at "
+                                     "bias 0; GSM8K 331 against 338 of 400 and HumanEval 149 against 148 of 164, "
+                                     "not significantly different",
+                        "mlx-community/Qwen3.6-35B-A3B-4bit": "the 4-bit pack the Q4_0 numbers are measured against"}}},
     {"id": "flash-next-exl3", "name": "Qwen3.8-Flash-Next (3-bit EXL3 experts)",
      "about": "the largest; 512 experts a layer",
-     "repo": "mlx-community/Qwen3.8-Flash-Next-4bit", "rev": "07b5dc6c54600a359b87f1e53e7adf6351c72a2c",
+     "repo": "mlx-community/Qwen3.8-Flash-Next-4bit", "base": "Qwen/Qwen3.8-Flash-Next", "rev": "07b5dc6c54600a359b87f1e53e7adf6351c72a2c",
      "experts_repo": "beamster/Qwen3.8-Flash-Next-Sushi-3bpw",
      "experts_rev": "76bd8f55df2bd4ab6297101c57bf86d450ac0aa3",
      "recipe": "store", "gated": True, "native": True, "hf_layout": True,
@@ -60,12 +73,18 @@ CURATED = [
      "recipe": "store", "license": "tongyi-qianwen",
      "notes": {"q3": "measured on this model: perplexity +7.6%, 6 of 6 instruction prompts still right"}},
     {"id": "qwen3-8b", "name": "Qwen3-8B", "about": "dense, fits in memory",
-     "repo": "mlx-community/Qwen3-8B-4bit", "rev": "545dc4251c05440727734bcd94334791f6ab0192",
+     "repo": "mlx-community/Qwen3-8B-4bit", "base": "Qwen/Qwen3-8B", "rev": "545dc4251c05440727734bcd94334791f6ab0192",
      "license": "apache-2.0"},
     {"id": "qwen3-4b", "name": "Qwen3-4B", "about": "dense, small and fast",
-     "repo": "mlx-community/Qwen3-4B-4bit", "rev": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+     "repo": "mlx-community/Qwen3-4B-4bit", "base": "Qwen/Qwen3-4B", "rev": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
      "license": "apache-2.0"},
 ]
+
+
+def for_backend(c, backend):
+    """Curated entry c as it installs on this backend: with its "cuda" overrides on CUDA."""
+    o = c.get("cuda")
+    return {**c, **o} if o and backend == "cuda" else c
 
 
 class Unsupported(Exception):
@@ -202,6 +221,16 @@ def hf_entry(e):
                      download=base + sum(xfiles.values()),
                      disk=base + f["expert_bytes"] * f["experts"] * f["moe_layers"],
                      transient=two)
+        elif e.get("gguf"):                     # GGUF experts beside the base's trunk, plus the model's MTP head
+            g, h = e["gguf"], e["mtp"]
+            n = f["experts"] * f["moe_layers"]
+            base = size - f["expert_bytes"] * n
+            f["expert_bytes"] = g["experts_bytes"] // n
+            # Bits a weight with the scales (4.52 for Q4_0 / Q4_1); the pack's expert_quant carries the same number.
+            f.update(bits=round(8 * g["experts_bytes"] / (3 * f["hidden"] * f["d_ff"] * n), 2), format="gguf")
+            head = int(h["bytes"] * machine.bytes_per_weight(4, 64) / 2)
+            e.update(download=base + g["size"] + h["bytes"], disk=base + g["experts_bytes"] + head,
+                     transient=max(two, g["size"], h["bytes"]))
         else:
             e.update(download=size, disk=size, transient=two)
     else:
@@ -320,7 +349,7 @@ def siblings(e, limit=4):
         return _SIBS[repo]
     owner, out = repo.split("/")[0], []
     _SIBS[repo] = out
-    if e.get("experts_repo"):                  # an EXL3 pack: its 4-bit base is a variant too
+    if e.get("experts_repo") or e.get("gguf"):     # EXL3 or GGUF experts: the 4-bit base is a variant too
         out.append(hf_entry({k: e[k] for k in ("repo", "rev", "recipe", "gated", "native") if k in e}
                             | {"id": repo.replace("/", "--"), "name": repo.split("/")[1]}))
     for r in HfApi().list_models(author=owner, search=m["stem"], limit=50, expand=["sha", "gated"]):
@@ -367,6 +396,7 @@ def variants(e, models, sibs=None):
     e = library.adopt(e, models, copies)
     f, notes = e["facts"], e.get("notes", {})
     bits_word = "EXL3 3-bit experts" if f.get("format") == "exl3" else \
+        f"GGUF {e['gguf']['types']} experts" if f.get("format") == "gguf" else \
         f"{f['bits']}-bit" if f["bits"] < 16 else "16-bit"
     out = [{"key": "published", "label": f"as published, {bits_word}", "entry": e,
             "note": notes.get("published", "the model as published")}]
@@ -375,7 +405,7 @@ def variants(e, models, sibs=None):
         out.append({"key": s["repo"], "label": f"{b}-bit" if b < 16 else "16-bit",
                     "entry": library.adopt(s, models, copies),
                     "note": notes.get(s["repo"], BIT_NOTES.get(b, "")) + f" | {s['repo']}"})
-    if f.get("format") != "exl3" and f["bits"] < 16 and f.get("group"):
+    if f.get("format") not in ("exl3", "gguf") and f["bits"] < 16 and f.get("group"):
         for b in (4, 3):
             if b < f["bits"]:
                 note = notes.get(f"q{b}", BIT_NOTES[b] + f"; rounded from the published {f['bits']}-bit, "
@@ -431,11 +461,14 @@ def prepare(e, models, py=sys.executable):
     f = e["facts"]
     if e.get("needs_pack"):
         _run([py, str(TOOLS / "stream_pack.py"), "--from-dir", e["path"], "--out", str(d)])
+    elif e.get("gguf"):
+        _pack_gguf(e, d, py)
     elif f["kind"] == "moe":
         cmd = [py, str(TOOLS / "stream_pack.py"), "--repo", e["repo"], "--revision", e["rev"], "--out", str(d)]
         cmd += ["--hf-layout"] if e.get("hf_layout") else []
         cmd += ["--skip-experts"] if e.get("experts_repo") else []
-        _run(cmd)
+        if not (d / ".exl3_state.json").exists():      # EXL3 shards in: the trunk is done, a rerun truncates experts.bin
+            _run(cmd)
         if e.get("experts_repo"):
             _pack_exl3(e, d)
     else:
@@ -503,6 +536,70 @@ def _pack_exl3(e, d):
     (d / "config.json").write_text(json.dumps(cfg, indent=2))
     state_p.unlink()
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _pack_gguf(e, d, py=sys.executable):
+    """The base's trunk, the GGUF's routed experts and the model's own 4-bit MTP head into d, each step
+    skipped once its last file is in place, so a rerun resumes (the GGUF download resumes too)."""
+    from huggingface_hub import hf_hub_download
+    g, h = e["gguf"], e["mtp"]
+    if not (d / "config.json").exists():       # the trunk is made aside, so it never touches experts.bin
+        t = d / "_trunk"
+        _run([py, str(TOOLS / "stream_pack.py"), "--repo", e["repo"], "--revision", e["rev"], "--out", str(t),
+              "--skip-experts"])
+        cfg = json.loads((t / "config.json").read_text())
+        cfg["expert_quant"] = {"format": "gguf", "bits": e["facts"]["bits"],
+                               "source": f"{g['repo']}/{g['file']}@{g['rev']}"}
+        (t / "config.json").unlink()
+        for p in t.iterdir():
+            if p.name not in ("experts.bin", "experts_index.json"):
+                p.replace(d / p.name)
+        (d / "config.json").write_text(json.dumps(cfg, indent=2))
+        shutil.rmtree(t)
+    if not (d / "experts_index.json").exists():    # gguf_repack.py writes the index last
+        tmp = d / "_download_gguf"
+        src = Path(hf_hub_download(g["repo"], g["file"], revision=g["rev"], local_dir=str(tmp)))
+        _run([py, str(TOOLS / "gguf_repack.py"), str(src), "--out", str(d / "experts.bin"),
+              "--layers", str(e["facts"]["layers"])])  # an MTP block past the trunk stays out
+        shutil.rmtree(tmp)
+    head = d / MTP_PACK
+    if not head.with_name(head.stem + "-quant.json").exists():   # mtp_pack.py writes it last
+        _fetch_mtp(h["repo"], h["rev"], d / "_mtp" / "mtp.safetensors")
+        _run([py, str(TOOLS / "mtp_pack.py"), "--src", str(d / "_mtp"), "--out", str(head)])
+        shutil.rmtree(d / "_mtp")
+
+
+def _fetch_mtp(repo, rev, dst, fs=None):
+    """The checkpoint's mtp.* tensors into one safetensors file at dst, range-read from its shards
+    instead of downloading the whole model."""
+    from huggingface_hub import HfFileSystem
+    fs = fs or HfFileSystem()
+    wm = json.loads(fs.read_text(f"{repo}/model.safetensors.index.json", revision=rev))["weight_map"]
+    src = {}
+    for sh in sorted({v for k, v in wm.items() if k.startswith("mtp.")}):
+        with fs.open(f"{repo}/{sh}", "rb", revision=rev) as f:
+            n = int.from_bytes(f.read(8), "little")
+            src.update({k: (sh, 8 + n, v) for k, v in json.loads(f.read(n)).items() if k.startswith("mtp.")})
+    hdr, off = {}, 0
+    for k, (_, _, v) in sorted(src.items()):
+        lo, hi = v["data_offsets"]
+        hdr[k] = {"dtype": v["dtype"], "shape": v["shape"], "data_offsets": [off, off + hi - lo]}
+        off += hi - lo
+    blob = json.dumps(hdr).encode()
+    blob += b" " * (-len(blob) % 8)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "wb") as out:
+        out.write(len(blob).to_bytes(8, "little") + blob)
+        for k, (sh, data0, v) in sorted(src.items()):
+            lo, hi = v["data_offsets"]
+            with fs.open(f"{repo}/{sh}", "rb", revision=rev) as f:
+                f.seek(data0 + lo)
+                while lo < hi:
+                    buf = f.read(min(64 << 20, hi - lo))
+                    if not buf:
+                        raise OSError(f"{sh}: the download stopped inside {k}")
+                    out.write(buf)
+                    lo += len(buf)
 
 
 def native_ready(py=sys.executable):
@@ -631,6 +728,7 @@ def listing(prof, models, disk, fetch=None, say=None):
     say = say or (lambda *a: None)
     out = []
     for c in CURATED:
+        c = for_backend(c, prof["backend"])
         say(f"checking {c['name']}...")
         d = model_dir(c, models)
         try:
@@ -658,7 +756,7 @@ def listing(prof, models, disk, fetch=None, say=None):
 
 
 def show(table, models, disk, start=1):
-    tested = {c["id"] for c in CURATED}
+    tested = {c["id"] for c in CURATED} | {for_backend(c, "cuda")["id"] for c in CURATED}
     for i, (e, vs) in enumerate(table, start):
         print(f" {i:>2}  {e['name']}{' (tested)' if e['id'] in tested else ''} | {describe(e['facts'])} | "
               f"{e.get('about', '')}" + (f" | license {e['license']}" if e.get("license") else ""))
@@ -713,6 +811,7 @@ def auto_candidates(prof, models, disk, fetch=None, log=None):
     log = log or (lambda *a: None)
     out = []
     for c in CURATED:
+        c = for_backend(c, prof["backend"])
         d = model_dir(c, models)
         e = {**c, **(load_json(d / "launcher.json") or {})} if is_ready(d) else None
         if not e or not e.get("facts"):
@@ -1090,21 +1189,30 @@ def delete_cli(args):
     """--delete ID --variant KEY: the folder the launcher keeps that variant in, deleted after a yes
     (--yes answers it); the exit code says whether it was."""
     models = Path(args.models_dir).expanduser()
-    ident = args.delete if args.variant == "published" else \
-        f"{args.delete}-{args.variant}" if args.variant in ("q3", "q4") else args.variant.replace("/", "--")
+    backend = machine.facts().get("backend")
+    # A listed id names the entry this backend installs (on CUDA qwen3.6-35b is the folder qwen3.6-35b-q40).
+    cur = next((for_backend(c, backend) for c in CURATED if args.delete in (c["id"], for_backend(c, backend)["id"])), None)
+    name = cur["id"] if cur else args.delete
+    ident = name if args.variant == "published" else \
+        f"{name}-{args.variant}" if args.variant in ("q3", "q4") else args.variant.replace("/", "--")
     d = models / ident
-    if d.is_dir() and not args.yes:
-        if ask(f"Delete {args.delete} {args.variant} at {d} ({tree_bytes(d) / GB:.1f} GB)? type yes: ").lower() != "yes":
-            print("Not deleted.")
-            return 1
+
+    def sure(at):
+        return args.yes or ask(f"Delete {args.delete} {args.variant} at {at} ({tree_bytes(at) / GB:.1f} GB)? "
+                               "type yes: ").lower() == "yes"
+    if d.is_dir() and not sure(d):
+        print("Not deleted.")
+        return 1
     ok, why = delete_folder(d, models)
     if not ok and not d.is_dir():
         try:                                   # the folder the list found it in, if it is not that one
-            cur = next(c for c in CURATED if c["id"] == args.delete)
-            at = by_variant(hf_entry(cur), args.variant, models).get("path")
+            at = by_variant(hf_entry(cur), args.variant, models).get("path") if cur else None
         except (Exception, SystemExit):        # not a tested model, or Hugging Face is out of reach
             at = None
         if at and library.inside(at, models):
+            if not sure(Path(at)):
+                print("Not deleted.")
+                return 1
             ok, why = delete_folder(at, models)
         elif at:
             why = (f"{args.delete} {args.variant} is at {library.short_path(at)}, outside the launcher's models "
@@ -1356,6 +1464,7 @@ class TuiBackend(tui.Backend):
 
     def models(self, say):
         for c in CURATED:
+            c = for_backend(c, (self.prof or {}).get("backend"))
             say(f"checking {c['name']}...")
             d = model_dir(c, self.mdir)
             try:
@@ -1877,7 +1986,9 @@ def by_variant(e, key, models):
 def pick(args, prof, models, disk):
     """The entry to run: from --model (and --variant), else the menu."""
     if args.model:
-        cur = {e["id"]: e for e in CURATED}
+        cur = {}
+        for c in CURATED:                      # on CUDA a listed id and its CUDA id name the same entry
+            cur[c["id"]] = cur[for_backend(c, prof["backend"])["id"]] = for_backend(c, prof["backend"])
         if args.model in cur:
             e = hf_entry(cur[args.model])
         elif Path(args.model).expanduser().exists():
@@ -1892,7 +2003,7 @@ def pick(args, prof, models, disk):
     entries = []
     for e in CURATED:
         try:
-            entries.append(hf_entry(e))
+            entries.append(hf_entry(for_backend(e, prof["backend"])))
         except Unsupported as err:
             print(f"  {e['name']}: {err}")
         except Exception as err:
@@ -1968,6 +2079,7 @@ def main():
     ap.add_argument("--pick", action="store_true", help="the menu (the default when you run ./larder in a terminal)")
     ap.add_argument("--text", action="store_true", help="the menu as plain text, for terminals without curses")
     ap.add_argument("--prepare", help=argparse.SUPPRESS)           # the menu installs in a process it can stop
+    ap.add_argument("--serve", help=argparse.SUPPRESS)             # a CUDA start continues here after exec
     ap.add_argument("--auto", action="store_true", help="run the recommended model with no questions")
     ap.add_argument("--stop", action="store_true", help="stop the server this launcher started")
     ap.add_argument("--status", action="store_true", help="print the server this launcher started")
@@ -2000,6 +2112,11 @@ def main():
     if args.prepare:
         prepare(json.loads(Path(args.prepare).read_text()), Path(args.models_dir).expanduser())
         return
+    if args.serve:                             # the CUDA plan, served from a process that never imported MLX
+        p = json.loads(Path(args.serve).read_text())
+        Path(args.serve).unlink()
+        machine.KEY[:] = [p["fp"]]             # the machine's key as read before exec: reading it again imports MLX
+        return serve(args, p["e"], Path(p["d"]), p["s"], p["est"], p["variant"], p["unattended"])
     # ./larder with nothing else opens the full-screen menu, while a script without a terminal and
     # --dry-run get the recommended model with no questions.
     if not (args.model or args.search or args.list or args.pick or args.auto):
@@ -2102,6 +2219,19 @@ def main():
                                "--model", str(d), "--port", str(port), *s["args"]]))
         print("why: " + "; ".join(s["why"]))
         return
+    if prof["backend"] == "cuda" and "mlx.core" in sys.modules:
+        # Importing MLX holds a CUDA context (128 MiB of VRAM) for this process's life: serve from a fresh process.
+        plan = cache_file(f"serve-{os.getpid()}.json")
+        plan.write_text(json.dumps({"e": e, "d": str(d), "s": s, "est": est, "variant": variant, "unattended": unattended,
+                                    "fp": machine.fingerprint()}))
+        sys.stdout.flush()
+        os.execv(sys.executable, [sys.executable, str(HERE / "launch.py"), *sys.argv[1:], "--serve", str(plan)])
+    serve(args, e, d, s, est, variant, unattended)
+
+
+def serve(args, e, d, s, est, variant, unattended):
+    """Start the planned server and stay with it: banner, chat or speed watch, and stop it on exit."""
+    port = args.port
     note_estimate(e, d, est, s)
     machine.CACHE.mkdir(parents=True, exist_ok=True)
     log = machine.CACHE / f"server-{time.strftime('%Y%m%d-%H%M%S')}.log"
