@@ -57,13 +57,16 @@ cd ~/larder
 ./larder
 ```
 
+The first `./larder`, `--list` or `--auto` measures the GPU and the SSD and takes 10 to 20 s; later runs reuse it.
+
 `./larder` opens a full-screen menu. It measures the machine, lists the tested models with the speed it expects on this computer, and shows what Enter will do: install, download, or why a model cannot run here. The choice is installed with a progress bar, the server starts, and the screen shows the chat address, the API address and the model id.
 
 ```bash
 ./larder                      # the menu
 ./larder --model qwen1.5-moe  # skip the menu with a listed model
 ./larder --auto               # no questions: the recommended model
-./larder --list               # the models and this machine's speed estimate
+./larder --list               # the models, the id --model takes, and this machine's speed estimate
+./larder --auto --dry-run     # show what would be installed and run; nothing is downloaded or started
 ./larder stop                 # stop the server it started
 ./larder status               # what is running, and where
 ```
@@ -72,13 +75,16 @@ The manual path:
 
 ```bash
 git clone https://github.com/IamCooller/larder && cd larder
-python3 -m venv .venv
+python3 --version                  # must print 3.10 or newer; the system python3 on a stock Mac is 3.9
+python3.13 -m venv .venv           # any Python 3.10 or newer (on a Mac: brew install python@3.13)
 .venv/bin/pip install -r requirements.txt
-native/build.sh .venv/bin/python   # optional: the native reader, faster expert reads
+native/build.sh .venv/bin/python   # macOS only: the native reader, faster expert reads
 ./larder
 ```
 
-Without `native/build.sh` the engine still runs, on its slower Python read path. On a Mac the same script also builds the Neural Engine extension (see [Quality](#quality-what-changes-a-reply-and-what-does-not)).
+On Linux skip `native/build.sh` and build the CUDA reader once with `PYTHONPATH=native .venv/bin/python -c 'import moe_pipe_cuda'` (it needs g++ and a CUDA toolkit; this is the step `install.sh` runs). The reader is also built with g++ the first time the engine needs it, so a manual clone works without that command; it only moves the build, and its errors, to the first start.
+
+Without the native reader the engine still runs, on its slower Python read path. On a Mac `native/build.sh` also builds the Neural Engine extension (see [Quality](#quality-what-changes-a-reply-and-what-does-not)).
 
 ## What you see
 
@@ -115,7 +121,7 @@ The API ignores the model name in a request because one server serves one model.
 |---|---|
 | Computers | Apple Silicon Mac with macOS (Metal); Linux x86_64 with an NVIDIA GPU (CUDA) |
 | Memory | 16 GB is what we tested; the launcher sizes the expert cache from the memory free at that moment and refuses a model that cannot fit |
-| Disk | the model plus 10 GB kept free for the system; the smallest tested model is 8.5 GB |
+| Disk | the model plus 10 GB kept free for the system; the smallest tested model is 2.3 GB (Qwen3-4B). The Python packages take about 0.6 GB on a Mac and, with the CUDA wheels, about 3.2 GB on Linux, and pip's download cache adds about 2 GB more there until you delete it (Linux PC, 2026-11-12) |
 | Software | Python 3.10 or newer, git, and on macOS the Xcode command line tools for the native reader (the installer checks all three) |
 | Not supported | Windows; Intel Macs; Linux without an NVIDIA GPU; AMD or Intel GPUs |
 
@@ -262,7 +268,7 @@ More questions are answered in `docs/FAQ.md`.
 
 ## Uninstall and where files live
 
-Nothing is installed outside these places:
+Besides the caches listed last, nothing is installed outside these places:
 
 - **The engine**: the folder it was installed into (`~/larder` from `install.sh`, or your clone) with its
   `.venv`. The native extensions (`moe_native`, `_ane_mlx`) are built into the Python that runs the engine,
@@ -276,6 +282,9 @@ Nothing is installed outside these places:
   library's profile or memory features.
 - **Hugging Face's cache**: `~/.cache/huggingface/` holds the small config files the launcher reads before a
   download. Other programs share it; leave it if you use them.
+- **Caches of the tools the installer uses**: pip's download cache, `~/.cache/pip` on Linux (2.0 GB after the
+  install on the Linux PC, 2026-11-12) and `~/Library/Caches/pip` on macOS, and on Linux NVIDIA's
+  `~/.nv/ComputeCache` (113 MB). Other programs share them; `pip cache purge` empties pip's.
 
 To remove everything:
 
