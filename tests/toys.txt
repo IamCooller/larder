@@ -91,3 +91,5 @@ tests/test_tools_parse.py
 tests/test_quality_gate.py
 tests/test_golden_check.py
 tests/test_persist.py
+tests/test_device_room.py
+tests/test_graph_cache_env.py

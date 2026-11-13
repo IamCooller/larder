@@ -11,7 +11,8 @@ import numpy as np
 
 import mlx.core as mx
 
-from gguf_ref import TYPES, NAME_OF, KVALUES_IQ4NL, IQ3XXS_GRID, IQ2S_GRID, HALVES, ref_dequant, random_experts  # noqa: F401
+from gguf_ref import (TYPES, NAME_OF, KVALUES_IQ4NL, IQ3XXS_GRID, IQ2S_GRID, IQ2XXS_GRID, IQ2XS_GRID,  # noqa: F401
+                      IQ3S_GRID, IQ1S_GRID, KVALUES_FP4, HALVES, ref_dequant, random_experts)
 
 # ---- GPU kernels: one source for Metal and CUDA, over a backend prelude (gguf_metal.py, gguf_cuda.py) that
 # defines GPTR, LOCAL, FN, CFN, H2F, SHFL, POPC, EXP, MUL/ADD/SUB (rounded alone, never fused) and the
@@ -20,10 +21,16 @@ from gguf_ref import TYPES, NAME_OF, KVALUES_IQ4NL, IQ3XXS_GRID, IQ2S_GRID, HALV
 # Type traits, a block's 32 or 256 weights decoded 8 at a time ("tasks"): a task's weights 0-3 go with
 # x[i0 + 0..3] and 4-7 with x[i0 + gg_run(T) + 0..3].
 HEADER = r"""
-CFN uint32_t gg_be(int T) { return (T == 12 || T == 13 || T == 18 || T == 22 || T == 23) ? 256u : T == 42 ? 64u : 32u; }
+CFN uint32_t gg_be(int T) {
+  return (T == 12 || T == 13 || T == 18 || T == 22 || T == 23 || T == 10 || T == 11 || T == 14 || T == 16 ||
+          T == 17 || T == 19 || T == 21 || T == 29 || T == 34 || T == 35) ? 256u :
+         T == 41 ? 128u : (T == 42 || T == 40) ? 64u : (T == 0 || T == 1 || T == 30 || T == 43) ? 1u : 32u;
+}
 CFN uint32_t gg_bb(int T) {
   return T == 3 ? 20u : T == 6 ? 22u : T == 7 ? 24u : T == 8 ? 34u : T == 12 ? 144u : T == 13 ? 176u :
-         T == 18 ? 98u : T == 22 ? 82u : T == 23 ? 136u : 18u;
+         T == 18 ? 98u : T == 22 ? 82u : T == 23 ? 136u : T == 10 ? 84u : (T == 11 || T == 21) ? 110u :
+         T == 14 ? 210u : (T == 16 || T == 35) ? 66u : T == 17 ? 74u : T == 19 ? 50u : T == 29 ? 56u :
+         T == 34 ? 54u : T == 39 ? 17u : T == 40 ? 36u : T == 0 ? 4u : (T == 1 || T == 30) ? 2u : T == 43 ? 1u : 18u;
 }
 CFN uint32_t gg_run(int T) {
   return (T == 12 || T == 13) ? 32u : (T == 2 || T == 3 || T == 6 || T == 7 || T == 20 || T == 23) ? 16u : 4u;
@@ -53,6 +60,176 @@ FN void gg_scale_min(uint32_t s0, uint32_t s1, uint32_t s2, uint32_t c, LOCAL ui
     *sc1 = (gg_byte(s2, j1) & 0xFu) | ((gg_byte(s0, j1) >> 6u) << 4u);
     *m1 = (gg_byte(s2, j1) >> 4u) | ((gg_byte(s1, j1) >> 6u) << 4u);
   }
+}
+
+// Table offsets in tab (uint32 words): kvalues_iq4nl, iq3xxs_grid, iq2s_grid / iq2xxs_grid / iq2xs_grid / iq1s_grid
+// as (low, high) word pairs, iq3s_grid, kvalues_fp4.
+#define TB_IQ2XXS 2320u
+#define TB_IQ2XS 2832u
+#define TB_IQ3S 3856u
+#define TB_IQ1S 4368u
+#define TB_FP4 8464u
+FN uint32_t gg_parity(uint32_t s7) { return s7 | ((POPC(s7) & 1u) << 7u); }
+FN float gg_e4m3(uint32_t e, uint32_t m, uint32_t bias) {      // a normal or subnormal E4M3 magnitude times 2^(7 - bias)
+  return e == 0u ? MUL(float(m), U2F((127u - bias - 2u) << 23u)) : U2F(((e + 127u - bias) << 23u) | (m << 20u));
+}
+
+// The types whose task k is weights 8k .. 8k + 7 of the row, in order (all those added after the first twelve).
+template <int T>
+FN uint32_t gg_task8(GPTR(uint8_t) row, uint32_t k, LOCAL float *w, GPTR(uint32_t) tab) {
+  const uint32_t e0 = 8u * k, o = e0 % gg_be(T);
+  GPTR(uint8_t) b = row + (e0 / gg_be(T)) * gg_bb(T);
+  if (T == 10 || T == 11 || T == 14) {    // Q2_K, Q3_K, Q6_K: weight 128h + 32j + l
+    const uint32_t h = o >> 7u, j = (o >> 5u) & 3u, l0 = o & 31u, s = 8u * h + 2u * j + (l0 >> 4u);
+    if (T == 10) {                        // d * sc * q - dmin * m, 2 bits at 2j of qs[32h + l]
+      const uint32_t sc = uint32_t(b[s]);
+      const float dl = MUL(gg_h(b + 80), float(sc & 0xFu)), ml = MUL(gg_h(b + 82), float(sc >> 4u));
+      const uint32_t q0 = gg_ld32a(b + 16u + 32u * h + l0), q1 = gg_ld32a(b + 20u + 32u * h + l0);
+      for (uint32_t t = 0u; t < 4u; t++) {
+        w[t] = SUB(MUL(dl, float((q0 >> (8u * t + 2u * j)) & 3u)), ml);
+        w[4u + t] = SUB(MUL(dl, float((q1 >> (8u * t + 2u * j)) & 3u)), ml);
+      }
+    } else if (T == 11) {                 // d * (sc - 32) * (q - 4 where bit 4h + j of hmask[l] is clear)
+      const uint32_t lo = s < 8u ? uint32_t(b[96u + s]) & 0xFu : uint32_t(b[88u + s]) >> 4u;
+      const uint32_t hi = (uint32_t(b[104u + (s & 3u)]) >> (2u * (s >> 2u))) & 3u;
+      const float dl = MUL(gg_h(b + 108), float(int(lo | (hi << 4u)) - 32));
+      const uint32_t q0 = gg_ld32(b + 32u + 32u * h + l0), q1 = gg_ld32(b + 36u + 32u * h + l0);
+      const uint32_t m0 = gg_ld32(b + l0), m1 = gg_ld32(b + 4u + l0), hb = 4u * h + j;
+      for (uint32_t t = 0u; t < 4u; t++) {
+        w[t] = MUL(dl, float(int((q0 >> (8u * t + 2u * j)) & 3u) - (((m0 >> (8u * t + hb)) & 1u) ? 0 : 4)));
+        w[4u + t] = MUL(dl, float(int((q1 >> (8u * t + 2u * j)) & 3u) - (((m1 >> (8u * t + hb)) & 1u) ? 0 : 4)));
+      }
+    } else {                              // Q6_K: d * sc * (q - 32), here g = j
+      const float ds = MUL(gg_h(b + 208), float(int(int8_t(b[192u + s]))));
+      GPTR(uint8_t) pl = b + 64u * h + 32u * (j & 1u) + l0;
+      const uint32_t l0w = gg_ld32(pl), l1w = gg_ld32(pl + 4), sh = 4u * (j >> 1u);
+      const uint32_t h0 = gg_ld32(b + 128u + 32u * h + l0), h1 = gg_ld32(b + 132u + 32u * h + l0);
+      for (uint32_t t = 0u; t < 4u; t++) {
+        w[t] = MUL(ds, float(int(((l0w >> (8u * t + sh)) & 0xFu) | (((h0 >> (8u * t + 2u * j)) & 3u) << 4u)) - 32));
+        w[4u + t] = MUL(ds, float(int(((l1w >> (8u * t + sh)) & 0xFu) | (((h1 >> (8u * t + 2u * j)) & 3u) << 4u)) - 32));
+      }
+    }
+    return e0;
+  }
+  if (T == 16 || T == 17 || T == 21) {    // IQ2_XXS, IQ2_XS, IQ3_S: db * grid, signed; weight 32ib + 8l + t
+    const uint32_t ib = o >> 5u, l = (o >> 3u) & 3u;
+    const float d = gg_h(b);
+    float db;
+    uint32_t lo, hi, sg;
+    if (T == 16) {
+      const uint32_t aux = gg_ld32(b + 6u + 8u * ib);
+      db = MUL(MUL(d, ADD(0.5f, float(aux >> 28u))), 0.25f);
+      const uint32_t g = TB_IQ2XXS + 2u * uint32_t(b[2u + 8u * ib + l]);
+      lo = tab[g];
+      hi = tab[g + 1u];
+      sg = gg_parity((aux >> (7u * l)) & 127u);
+    } else if (T == 17) {
+      const uint32_t q = gg_ld16(b + 2u + 8u * ib + 2u * l), sc = uint32_t(b[66u + ib]);
+      db = MUL(MUL(d, ADD(0.5f, float(l < 2u ? (sc & 0xFu) : (sc >> 4u)))), 0.25f);
+      lo = tab[TB_IQ2XS + 2u * (q & 511u)];
+      hi = tab[TB_IQ2XS + 2u * (q & 511u) + 1u];
+      sg = gg_parity(q >> 9u);
+    } else {
+      const uint32_t qh = uint32_t(b[66u + ib]);
+      db = MUL(d, float(1u + 2u * ((uint32_t(b[106u + ib / 2u]) >> (4u * (ib % 2u))) & 0xFu)));
+      lo = tab[TB_IQ3S + (uint32_t(b[2u + 8u * ib + 2u * l]) | ((qh << (8u - 2u * l)) & 256u))];
+      hi = tab[TB_IQ3S + (uint32_t(b[3u + 8u * ib + 2u * l]) | ((qh << (7u - 2u * l)) & 256u))];
+      sg = uint32_t(b[74u + 4u * ib + l]);
+    }
+    for (uint32_t t = 0u; t < 4u; t++) {
+      w[t] = gg_sgn(MUL(db, float((lo >> (8u * t)) & 0xFFu)), sg, t);
+      w[4u + t] = gg_sgn(MUL(db, float((hi >> (8u * t)) & 0xFFu)), sg, 4u + t);
+    }
+    return e0;
+  }
+  if (T == 19 || T == 29) {               // IQ1_S, IQ1_M: dl * (grid + delta)
+    const uint32_t ib = o >> 5u, l = (o >> 3u) & 3u;
+    float dl, delta;
+    uint32_t idx;
+    if (T == 19) {
+      const uint32_t qh = gg_ld16(b + 34u + 2u * ib);
+      dl = MUL(gg_h(b), float(2u * ((qh >> 12u) & 7u) + 1u));
+      delta = (qh & 0x8000u) ? -0.125f : 0.125f;
+      idx = uint32_t(b[2u + 4u * ib + l]) | (((qh >> (3u * l)) & 7u) << 8u);
+    } else {
+      const uint32_t s0 = gg_ld16(b + 48), s1 = gg_ld16(b + 50), s2 = gg_ld16(b + 52), s3 = gg_ld16(b + 54);
+      const float d = H2F((s0 >> 12u) | ((s1 >> 8u) & 0xF0u) | ((s2 >> 4u) & 0xF00u) | (s3 & 0xF000u));
+      const uint32_t sw = ib / 2u == 0u ? s0 : ib / 2u == 1u ? s1 : ib / 2u == 2u ? s2 : s3;
+      dl = MUL(d, float(2u * ((sw >> (6u * (ib % 2u) + 3u * (l >> 1u))) & 7u) + 1u));
+      const uint32_t nb = (uint32_t(b[32u + 2u * ib + (l >> 1u)]) >> (4u * (l & 1u))) & 0xFu;
+      delta = (nb & 8u) ? -0.125f : 0.125f;
+      idx = uint32_t(b[4u * ib + l]) | ((nb & 7u) << 8u);
+    }
+    const uint32_t lo = tab[TB_IQ1S + 2u * idx], hi = tab[TB_IQ1S + 2u * idx + 1u];
+    for (uint32_t t = 0u; t < 4u; t++) {
+      w[t] = MUL(dl, ADD(float(int(lo << (24u - 8u * t)) >> 24), delta));
+      w[4u + t] = MUL(dl, ADD(float(int(hi << (24u - 8u * t)) >> 24), delta));
+    }
+    return e0;
+  }
+  if (T == 34 || T == 35) {               // TQ1_0 (base-3 digits), TQ2_0 (2 bits): (q - 1) * d
+    const float d = gg_h(b + (T == 34 ? 52u : 64u));
+    // TQ1_0: weights 32n + m of qs[m] (o < 160), 160 + 16n + m of qs[32 + m] (o < 240), 240 + 4n + j of qh[j]
+    const uint32_t at = o < 160u ? o % 32u : o < 240u ? 32u + (o - 160u) % 16u : 48u;
+    const uint32_t n = o < 160u ? o / 32u : o < 240u ? (o - 160u) / 16u : (o - 240u) / 4u;
+    const uint32_t p0 = n == 0u ? 1u : n == 1u ? 3u : n == 2u ? 9u : n == 3u ? 27u : 81u;
+    const uint32_t p1 = o < 240u ? p0 : 3u * p0;
+    for (uint32_t t = 0u; t < 8u; t++) {
+      uint32_t q;
+      if (T == 35) {
+        q = (uint32_t(b[32u * (o >> 7u) + (o & 31u) + t]) >> (2u * ((o >> 5u) & 3u))) & 3u;
+      } else {
+        const uint32_t x = uint32_t(b[o < 240u ? at + t : at + (t & 3u)]);
+        q = (((x * (t < 4u ? p0 : p1)) & 0xFFu) * 3u) >> 8u;
+      }
+      w[t] = MUL(float(int(q) - 1), d);
+    }
+    return e0;
+  }
+  if (T == 39 || T == 40) {               // MXFP4 (e8m0 / 2), NVFP4 (ue4m3 / 2 a 16): kvalues_fp4[q] * d
+    float d;
+    uint32_t q;
+    if (T == 39) {
+      const uint32_t e = uint32_t(b[0]);
+      q = 1u + (o & 15u);
+      if (e < 2u) {                       // d subnormal, which Metal flushes: the product's bits built exactly
+        for (uint32_t t = 0u; t < 8u; t++) {
+          const int kv = gg_kv(tab, TB_FP4 + ((uint32_t(b[q + t]) >> (o >= 16u ? 4u : 0u)) & 0xFu));
+          const uint32_t m = uint32_t(kv < 0 ? -kv : kv) << e;                 // |kv * d| = m * 2^-128
+          w[t] = U2F((m >= 4u ? F2U(float(m)) - (128u << 23u) : m << 21u) | (kv < 0 ? 0x80000000u : 0u));
+        }
+        return e0;
+      }
+      d = U2F((e - 1u) << 23u);
+    } else {
+      const uint32_t x = uint32_t(b[o >> 4u]);
+      d = (x == 0u || x == 0x7Fu) ? 0.0f : gg_e4m3((x >> 3u) & 0xFu, x & 7u, 8u);
+      q = 4u + 8u * (o >> 4u);
+    }
+    const uint32_t sh = (T == 39 ? o >= 16u : ((o >> 3u) & 1u) == 1u) ? 4u : 0u;
+    for (uint32_t t = 0u; t < 8u; t++) w[t] = MUL(float(gg_kv(tab, TB_FP4 + ((uint32_t(b[q + t]) >> sh) & 0xFu))), d);
+    return e0;
+  }
+  if (T == 41) {                          // Q1_0: d where the bit is set, -d where not
+    const float d = gg_h(b);
+    const uint32_t q = uint32_t(b[2u + o / 8u]);
+    for (uint32_t t = 0u; t < 8u; t++) w[t] = ((q >> t) & 1u) ? d : -d;
+    return e0;
+  }
+  for (uint32_t t = 0u; t < 8u; t++) {   // F32, F16, BF16, F8_E4M3: 8 values from b
+    if (T == 0) {
+      w[t] = U2F(gg_ld32a(b + 4u * t));
+    } else if (T == 1) {
+      w[t] = H2F(gg_ld16(b + 2u * t));
+    } else if (T == 30) {
+      w[t] = U2F(gg_ld16(b + 2u * t) << 16u);
+    } else {
+      const uint32_t x = uint32_t(b[t]), a = x & 0x7Fu;
+      const float v = gg_e4m3(a >> 3u, a & 7u, 7u);
+      w[t] = a == 0x7Fu ? U2F(0x7FC00000u) : (x & 0x80u) ? -v : v;
+    }
+  }
+  return e0;
 }
 
 // Task k of the row at `row` (ggml type T) into w[0..7], every weight as ggml's dequantize_row_* rounds it;
@@ -178,6 +355,7 @@ FN uint32_t gg_task(GPTR(uint8_t) row, uint32_t k, LOCAL float *w, GPTR(uint32_t
     }
     return 256u * i + 32u * ib + 8u * l;
   }
+  if (T != 22) return gg_task8<T>(row, k, w, tab);
   {                                       // IQ2_S (22): d * (0.5 + s) * 0.25 * grid, signed
     const uint32_t i = k >> 5u, r = k & 31u, ib = r >> 2u, l = r & 3u;
     GPTR(uint8_t) b = row + i * 82u;
@@ -381,10 +559,14 @@ def _kernel(name, ins, outs):
 
 
 def _tab():
-    """The kernels' tables: kvalues_iq4nl, iq3xxs_grid and iq2s_grid as uint32 words."""
+    """The kernels' tables as uint32 words, at the TB_* offsets of HEADER."""
     if not _TAB:
-        _TAB.append(mx.array(np.concatenate([KVALUES_IQ4NL.astype(np.int32).view(np.uint32),
-                                             IQ3XXS_GRID.view("<u4").reshape(-1), IQ2S_GRID.view("<u4").reshape(-1)])))
+        words = [KVALUES_IQ4NL.astype(np.int32).view(np.uint32)] + [
+            np.ascontiguousarray(g).view("<u4").reshape(-1)
+            for g in (IQ3XXS_GRID, IQ2S_GRID, IQ2XXS_GRID, IQ2XS_GRID, IQ3S_GRID, IQ1S_GRID)]
+        words.append(KVALUES_FP4.astype(np.int32).view(np.uint32))
+        assert np.cumsum([len(w) for w in words]).tolist() == [16, 272, 2320, 2832, 3856, 4368, 8464, 8480]
+        _TAB.append(mx.array(np.concatenate(words)))
     return _TAB[0]
 
 

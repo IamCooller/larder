@@ -106,6 +106,18 @@ def main():
             raise SystemExit("a NaN scale was accepted")
         except AssertionError as e:
             print(f"refused: {e}")
+        # A type the engine does not decode (Q8_K, internal) and an id newer than any we know: one sentence each,
+        # naming the file and the type, before anything is written.
+        for tid, name in ((15, "Q8_K"), (99, "ggml type id 99")):
+            n = HID * INTER * E // 256 * 292
+            odd = (exps[2][0], exps[2][1], tid, bytes(n))
+            write_gguf(s1, kv, exps[:2] + [odd] + exps[3:6])
+            try:
+                gguf_repack.plan([s1])
+                raise SystemExit(f"{name} was accepted")
+            except ValueError as e:
+                assert s1.name in str(e) and name in str(e) and str(e).count(". ") == 0, e
+                print(f"refused: {e}")
     print("all GGUF repack checks passed")
 
 

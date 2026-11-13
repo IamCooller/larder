@@ -129,10 +129,10 @@ class Staging:
     def reserve(self, projs, top_k):
         """Both staging buffers at install, before the memory budget measures anything, since
         allocated inside a prefill they would read as that prefill's growth."""
-        stride = projs[0]._packed["stride"]
-        self._room(stride)
+        strides = [p._packed["stride"] for p in projs]
+        self._room(max(strides))
         if self.lm is None:
-            self.lm = self._managed(LMStage.REGIONS * len(projs) * top_k * room(stride))
+            self.lm = self._managed(LMStage.REGIONS * top_k * sum(room(s) for s in strides))
 
     def _room(self, stride):
         if stride <= self.stride:
@@ -207,7 +207,7 @@ class Staging:
             v0 = iov[0]
             proj.append(([v.ctypes.data for v in v0], [v.nbytes for v in v0], len(iov), bufs))
         first = [sum(len(q[1]) for q in proj[:j]) for j in range(len(proj))]   # index into dsts
-        rows, staged, plain, dma = [], [], [], []
+        rows, staged, plain, dma, starts = [], [], [], [], []
         for job in jobs:
             fd, jiov, foff, st = job
             p0 = jiov[0].ctypes.data
@@ -226,6 +226,7 @@ class Staging:
             j, sl = hit
             n = len(staged)
             staged.append((fd, foff, n))
+            starts.append(len(rows))
             src = n * room(stride) + lead(None if buffered else self._direct_fd(fd), foff) if SPANS else n * stride
             for k, b in enumerate(proj[j][1]):      # parts lie in the record in iov order
                 rows.append((first[j] + k, sl, src // 16, b // 16, -1))
@@ -266,7 +267,7 @@ class Staging:
         # record's rows going in exactly one batch.
         dsts = [b for (_, _, _, bufs) in proj for b in bufs]
         kern = self._kernel(len(dsts))
-        parts = len(rows) // len(staged)
+        starts.append(len(rows))        # record n's rows are rows[starts[n]:starts[n + 1]]
         batch = max(1, -(-len(staged) // BATCHES))
         futs = {pool.submit(run, w): w for w in work}
         ready, outs = [], []
@@ -276,14 +277,14 @@ class Staging:
             if w[0] == "s":
                 ready.append(w[1][2])
             if len(ready) >= batch or (ready and all(x.done() for x in futs)):
-                sel = [rows[n * parts + k] for n in sorted(ready) for k in range(parts)]
+                sel = [r for n in sorted(ready) for r in rows[starts[n]:starts[n + 1]]]
                 ready = []
                 outs += kern(inputs=[self.arr, *dsts, mx.array(np.array(sel, dtype=np.int32))],
                              grid=(len(sel) * THREADS, 1, 1), threadgroup=(THREADS, 1, 1),
                              output_shapes=[(1,)], output_dtypes=[mx.int32])
                 mx.async_eval(outs[-1])
         if ready:
-            sel = [rows[n * parts + k] for n in sorted(ready) for k in range(parts)]
+            sel = [r for n in sorted(ready) for r in rows[starts[n]:starts[n + 1]]]
             outs += kern(inputs=[self.arr, *dsts, mx.array(np.array(sel, dtype=np.int32))],
                          grid=(len(sel) * THREADS, 1, 1), threadgroup=(THREADS, 1, 1),
                          output_shapes=[(1,)], output_dtypes=[mx.int32])
@@ -378,11 +379,14 @@ class LMStage:
         import threading
         from concurrent.futures import ThreadPoolExecutor
         self.store, self.g = store, store.per_half
-        self.stride = store.slot_bytes // len(store.bufs)        # every projection's record
-        self.room = room(self.stride)
+        # Each projection's record (a GGUF layer's gate / up and down can differ), its staging room and parts.
+        glus = getattr(store, "glus", None)
+        self.strides = ([p._packed["stride"] for p in glus[0]._projs] if glus else
+                        [store.slot_bytes // len(store.bufs)] * len(store.bufs))
+        self.rooms = [room(s) for s in self.strides]
         self.nproj = len(store.bufs)
         self.parts = [[v[0].nbytes for v in vs] for vs in store.views]
-        self.region = self.nproj * self.g * self.room
+        self.region = self.g * sum(self.rooms)
         n = self.REGIONS * self.region
         self.staging, self.shared = staging, False
         if staging.lm is not None and staging.lm[1].nbytes >= n and not staging.lm_busy:
@@ -390,13 +394,18 @@ class LMStage:
             self.shared = staging.lm_busy = True
         else:
             self.arr, self.view = staging._managed(n)
-        self.aligned = self.view.ctypes.data % PAGE == 0 and (SPANS or self.stride % PAGE == 0)
+        self.aligned = self.view.ctypes.data % PAGE == 0 and (SPANS or all(s % PAGE == 0 for s in self.strides))
         self.kern = staging._kernel(sum(len(b) for b in store.bufs))
         self.pool = ThreadPoolExecutor(8)
         self.cv = threading.Condition()
         self.free = list(range(self.REGIONS))
         self.ready, self.owner = {}, {}
         self.stop = False
+
+    def _at(self, s, n, j, i):
+        """Staging offset of record i of projection j in region s holding n experts: projection j's n rooms follow
+        the earlier projections' (with equal records, (j * n + i) * room as before)."""
+        return s * self.region + n * sum(self.rooms[:j]) + i * self.rooms[j]
 
     def jobs(self, glu, ids, r0, copies, skip=()):
         """Reader thread: a free region for glu's experts `ids` and the reads (fd, room, offset,
@@ -410,17 +419,18 @@ class LMStage:
             s = self.free.pop()
         n, jobs, src = len(ids), [], {}
         for j, q in enumerate(glu._projs):
-            pk = q._packed
-            if pk["stride"] != self.stride:
-                raise ValueError("cuda stage: projections of different record sizes")
+            pk, st, r = q._packed, self.strides[j], self.rooms[j]
+            if pk["stride"] != st:
+                raise ValueError(f"cuda stage: a layer whose projection {j} record ({pk['stride']} B) is not its "
+                                 f"store's ({st} B)")
             fd = pk["fd"]
             d = self.staging._direct_fd(fd) if self.aligned else None
             for i, e in enumerate(ids.tolist()):
                 if i in copies or i in skip:
                     continue
-                at, off = s * self.region + (j * n + i) * self.room, pk["offset"] + e * self.stride
+                at, off = self._at(s, n, j, i), pk["offset"] + e * st
                 src[j, i] = at + lead(d, off) if SPANS else at
-                jobs.append((fd, self.view[at:at + self.room], off, self.stride, d))
+                jobs.append((fd, self.view[at:at + r], off, st, d))
         self.ready[r0] = (s, n, copies, skip, src)
         return jobs
 
@@ -428,23 +438,23 @@ class LMStage:
         """Reader thread: jobs() read here, returning the bytes read."""
         jobs = self.jobs(glu, ids, r0, copies, skip)
         list(self.pool.map(self.one, jobs))
-        return len(jobs) * self.stride
+        return sum(j[3] for j in jobs)
 
     def one(self, job):
         """One read of jobs(), whoever runs it."""
         if SPANS:
             self.staging.read(job)
             return
-        fd, v, off, _, d = job
+        fd, v, off, st, d = job
         if d is not None:
             try:
-                if os.preadv(d, [v], off) == self.stride:
+                if os.preadv(d, [v], off) == st:
                     return
             except OSError:
                 pass                                    # read again through the page cache
         got = os.preadv(fd, [v], off)
-        if got != self.stride:
-            raise OSError(f"short prefill read {got} of {self.stride}")
+        if got != st:
+            raise OSError(f"short prefill read {got} of {st}")
 
     def take(self, r0):
         """Model thread: queue the copies of r0's group from staging to store rows without waiting,
@@ -456,7 +466,7 @@ class LMStage:
             for i in range(n):
                 if i in skip:
                     continue
-                src = at.get((j, i), s * self.region + (j * n + i) * self.room)
+                src = at.get((j, i), self._at(s, n, j, i))
                 for k, b in enumerate(self.parts[j]):
                     rows.append((first + k, r0 + i, src // 16, b // 16, copies.get(i, -1)))
                     src += b

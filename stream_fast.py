@@ -3700,10 +3700,17 @@ def _device_room(need):
     if need is None:
         return True
     free = mx.device_info()["free_memory"] + mx.get_cache_memory()
-    if free < need:
-        print(f"  resident: {free / 1e9:.2f} GB of the device free for a pass of {need / 1e9:.2f} GB, the store shrinks",
-              flush=True)
-    return free >= need
+    if free >= need:
+        return True
+    # The last pass may still hold its buffers and CUDA's pool keeps freed blocks outside MLX's cache figure, so both go before a shrink.
+    cache, active, others = mx.get_cache_memory(), mx.get_active_memory(), vram_others()
+    mx.synchronize()
+    mx.clear_cache()
+    now = mx.device_info()["free_memory"]
+    print(f"  resident: {free / 1e9:.2f} GB of the device free for a pass of {need / 1e9:.2f} GB (MLX cache "
+          f"{cache / 1e9:.2f}, active {active / 1e9:.2f}, other processes {(others or 0) / 1e9:.2f} GB), "
+          f"{now / 1e9:.2f} GB with the pool cleared{', the store shrinks' if now < need else ''}", flush=True)
+    return now >= need
 
 
 def _group_rows(want, ids, slot_np, pool):
@@ -7664,9 +7671,11 @@ def _gguf_types(packed, gate_key):
         return None
     base = gate_key[:-len("gate_proj")]
     types = tuple(index[base + p]["parts"][0]["ggml_type"] for p in ("gate_proj", "up_proj", "down_proj"))
-    if not set(types) <= set(gguf_experts.TYPES) or BACKEND not in ("metal", "cuda"):
-        raise ValueError(f"GGUF experts: decoded here in {sorted(gguf_experts.TYPES)} on Metal or CUDA; got "
-                         f"{types} on {BACKEND}")
+    bad = [t for t in types if t not in gguf_experts.TYPES]
+    if bad or BACKEND not in ("metal", "cuda"):
+        where = getattr(packed.get("fd"), "name", "experts.bin")
+        raise ValueError(f"{where}: {base}* holds GGUF experts in {'/'.join(types)}, which this engine does not "
+                         f"decode {'(' + ', '.join(bad) + ')' if bad else 'on ' + BACKEND + ' (Metal or CUDA only)'}")
     return "/".join(types)
 
 

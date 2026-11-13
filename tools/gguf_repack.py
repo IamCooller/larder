@@ -23,15 +23,19 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from gguf_ref import HALVES, TYPES      # noqa: E402
+from gguf_ref import HALVES, TYPES, valid      # noqa: E402,F401
 
-# ggml type id -> (name, elements a block, bytes a block): gguf-py constants.py GGML_QUANT_SIZES.
+# ggml type id -> (name, elements a block, bytes a block): every type of gguf-py constants.py GGML_QUANT_SIZES
+# (llama.cpp dd6b945b), decoded or not, so any file's header parses.
 GGML = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20), 6: ("Q5_0", 32, 22),
-        7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34), 10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110),
-        12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176), 14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66),
-        17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98), 19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18),
-        21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56),
-        30: ("BF16", 1, 2), 39: ("MXFP4", 32, 17), 42: ("Q2_0", 64, 18)}
+        7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34), 9: ("Q8_1", 32, 36), 10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110),
+        12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176), 14: ("Q6_K", 256, 210), 15: ("Q8_K", 256, 292),
+        16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98), 19: ("IQ1_S", 256, 50),
+        20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
+        24: ("I8", 1, 1), 25: ("I16", 1, 2), 26: ("I32", 1, 4), 27: ("I64", 1, 8), 28: ("F64", 1, 8),
+        29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2), 34: ("TQ1_0", 256, 54), 35: ("TQ2_0", 256, 66),
+        39: ("MXFP4", 32, 17), 40: ("NVFP4", 64, 36), 41: ("Q1_0", 128, 18), 42: ("Q2_0", 64, 18),
+        43: ("F8_E4M3", 1, 1)}
 
 # GGUF value types: 0 u8 .. 12 f64, 8 string, 9 array.
 _SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
@@ -89,6 +93,9 @@ def read_header(f):
     data = pos + (-pos) % align
     for t in tensors:
         t["offset"] += data
+        if t["type"] not in GGML:
+            t["nbytes"] = None      # an unknown type: its size is unknown too; plan() refuses it if it is an expert
+            continue
         _, be, bb = GGML[t["type"]]
         n = 1
         for d in t["ne"]:
@@ -112,16 +119,16 @@ def plan(shards, layers=None):
     for L in sorted({L for L, _ in found}):
         assert all((L, p) in found for p in range(3)), f"layer {L}: gate, up and down not all present"
     for sh, t in found.values():
-        assert GGML[t["type"]][0] in TYPES, f"{t['name']}: {GGML[t['type']][0]} is not decoded by gguf_experts"
+        name = GGML[t["type"]][0] if t["type"] in GGML else f"ggml type id {t['type']}"
+        if name not in TYPES:
+            raise ValueError(f"{Path(sh).name}: {t['name']} is {name}, which the engine does not decode "
+                             f"(it decodes {', '.join(TYPES)})")
     return [(f"model.layers.{L}.mlp.switch_mlp.{PROJ[p]}_proj", *found[L, p]) for L, p in sorted(found)]
 
 
 def _finite(rec, t):
-    """Every block's f16 scales finite, the check llama.cpp runs on load."""
-    b = rec.reshape(-1, TYPES[t][2])
-    for at in HALVES[t]:
-        h = np.ascontiguousarray(b[:, at:at + 2]).view(np.uint16)
-        assert not ((h & 0x7C00) == 0x7C00).any(), f"{t}: a non-finite scale"
+    """Every block's scales (and float values) finite, the check llama.cpp runs on load (ggml_validate_row_data)."""
+    assert valid(rec.reshape(-1, TYPES[t][2]), t), f"{t}: a non-finite scale"
 
 
 def _drop(fd, off, n):

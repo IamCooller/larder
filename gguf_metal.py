@@ -9,6 +9,8 @@ PRELUDE = r"""
 #define FN static inline
 #define CFN static inline constexpr
 #define H2F(u) float(as_type<half>(ushort(u)))
+#define U2F(u) as_type<float>(uint(u))
+#define F2U(f) as_type<uint>(float(f))
 #define SHFL(v, m) simd_shuffle_xor(v, ushort(m))
 #define POPC(v) popcount(v)
 #define EXP(v) metal::exp(v)
