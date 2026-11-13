@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks the launcher's pieces on tiny synthetic checkpoints (a few MB) without a model or the
 network, from the catalog filter and flag choice to the decode estimate and stream_pack's new paths."""
+import contextlib
 import io
 import json
 import os
@@ -472,6 +473,18 @@ def check_auto(tmp):
         assert e["id"] == "fast" and variant == "published" and not tight  # else the recommendation
         e, variant, tight = launch.auto_pick(prof(avail=0.2), models, disk, fetch=fetch)
         assert e["id"] == "fast" and tight                                # busy: the idle choice
+        said = []
+        launch.auto_pick(p, models, disk, fetch=lambda c: entry(Q15, id=c["id"], name=c["name"], **small) if c["id"] != launch.CURATED[-1]["id"]
+                         else entry(Q15, id=c["id"], name="Huge", disk=1e15, download=1e15, transient=0), log=said.append)
+        assert any("Skipped Huge" in m for m in said), said               # a larger model left out says why
+        assert isinstance(launch.hf_problem(ModuleNotFoundError("mlx")), str) and "not installed" in launch.hf_problem(ModuleNotFoundError("mlx"))
+        assert "Hugging Face" in launch.hf_problem(OSError("net"))        # only a real failure blames the network
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            launch.show([(entry(Q15, id=launch.CURATED[0]["id"], name="Tested one"), [])], models, disk)
+        assert f"--model {launch.CURATED[0]['id']}" in shown.getvalue()   # --list names the id --model takes
+        assert launch.stop_hint().startswith("./larder stop")
+        assert launch.engine_log.verbose is False                         # the launcher prints no engine notes
 
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         threading.Thread(target=proc.wait, daemon=True).start()

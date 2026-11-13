@@ -28,6 +28,8 @@ import machine
 import tuner
 import tui
 
+engine_log.set_verbose(False)   # the engine's debugging notes stay out of the launcher's output
+
 HERE = Path(__file__).resolve().parent
 # The pack tools live in tools/; the launcher drives them.
 TOOLS = HERE / "tools"
@@ -725,6 +727,14 @@ def model_json(e, vs, models, disk, tested=False):
             "variants": [variant_json(r, models, disk) for r in vs]}
 
 
+def hf_problem(err):
+    """Why a model's facts could not be read: missing packages say so, anything else is the network."""
+    if isinstance(err, ModuleNotFoundError):
+        return ("the engine's packages are not installed in this Python "
+                "(run: .venv/bin/pip install -r requirements.txt, or the installer)")
+    return f"could not reach Hugging Face ({type(err).__name__})"
+
+
 def listing(prof, models, disk, fetch=None, say=None):
     """The model list as one JSON object, made on the computer that will run the models."""
     fetch = fetch or hf_entry
@@ -746,7 +756,7 @@ def listing(prof, models, disk, fetch=None, say=None):
             continue
         except Exception as err:
             out.append({"id": c["id"], "name": c["name"], "about": c.get("about", ""), "license": c.get("license", ""),
-                        "tested": True, "unavailable": f"could not reach Hugging Face ({type(err).__name__})",
+                        "tested": True, "unavailable": hf_problem(err),
                         "not_made": [], "variants": []})
             continue
         say(f"checking {c['name']}'s variants...")
@@ -761,7 +771,8 @@ def listing(prof, models, disk, fetch=None, say=None):
 def show(table, models, disk, start=1):
     tested = {c["id"] for c in CURATED} | {for_backend(c, "cuda")["id"] for c in CURATED}
     for i, (e, vs) in enumerate(table, start):
-        print(f" {i:>2}  {e['name']}{' (tested)' if e['id'] in tested else ''} | {describe(e['facts'])} | "
+        mark = " (tested, --model " + e["id"] + ")" if e["id"] in tested else ""
+        print(f" {i:>2}  {e['name']}{mark} | {describe(e['facts'])} | "
               f"{e.get('about', '')}" + (f" | license {e['license']}" if e.get("license") else ""))
         for j, r in enumerate(vs):
             got = library.lookup(r["e"]["facts"])
@@ -824,7 +835,8 @@ def auto_candidates(prof, models, disk, fetch=None, log=None):
                 log(f"  {c['name']}: {err}")
                 continue
             except Exception as err:
-                log(f"  {c['name']}: could not check it now ({type(err).__name__})")
+                log(f"  {c['name']}: " + (hf_problem(err) if isinstance(err, ModuleNotFoundError)
+                                    else f"could not check it now ({type(err).__name__})"))
                 continue
         e = library.adopt(e, models)
         out.append((e, judge(e, prof, models, disk)))
@@ -869,6 +881,10 @@ def auto_pick(prof, models, disk, fetch=None, log=None):
     table = auto_candidates(prof, models, disk, fetch=fetch, log=log)
     got = recommend(table, models)
     if got:
+        big = [(e2, r2) for e2, r2 in table if not r2["ok"] and e2.get("disk", 0) > got[0].get("disk", 0)]
+        if big and log:
+            e2, r2 = max(big, key=lambda x: x[0]["disk"])
+            log(f"  Skipped {e2['name']}: {r2['why']}")
         return got[0], "published", False
     idle = {**prof, "now": {**prof.get("now", {}), "avail_gb": None}}
     got = recommend([(e, judge(e, idle, models, disk)) for e, _ in table], models)
@@ -1243,6 +1259,11 @@ def delete_cli(args):
     return 0 if ok else 1
 
 
+def stop_hint():
+    """How to stop the server: Ctrl+C only works while a terminal still holds the launcher."""
+    return "./larder stop" + (" (or Ctrl+C here)" if sys.stdin.isatty() else "")
+
+
 def short_banner(name, port, est=None):
     """The whole output of an unattended run: where the chat is and how to stop it."""
     if est and est.get("label"):
@@ -1257,7 +1278,7 @@ def short_banner(name, port, est=None):
 
   Chat   {base}/
   API    {base}/v1    (OpenAI-compatible, no key needed)
-  Stop   ./larder stop   (or Ctrl+C here)
+  Stop   {stop_hint()}
 """, flush=True)
 
 
@@ -1562,7 +1583,7 @@ class TuiBackend(tui.Backend):
                 continue
             except Exception as err:
                 yield tui.Model(c["id"], c["name"], about=c.get("about", ""), license=c.get("license", ""), tested=True,
-                                unavailable=f"could not reach Hugging Face ({type(err).__name__})")
+                                unavailable=hf_problem(err))
                 continue
             say(f"checking {c['name']}'s variants...")
             yield self._model(e, True)
@@ -2092,7 +2113,7 @@ def pick(args, prof, models, disk):
         except Unsupported as err:
             print(f"  {e['name']}: {err}")
         except Exception as err:
-            print(f"  {e['name']}: could not reach Hugging Face ({type(err).__name__})")
+            print(f"  {e['name']}: {hf_problem(err)}")
     found = []
     while True:
         print("\nChecking each model's variants...", flush=True)
@@ -2288,7 +2309,7 @@ def main():
         else:
             print(f"\n{e['name']}: download {e['download'] / GB:.1f} GB, {e['disk'] / GB:.1f} GB more on disk, "
                   f"to {d}" + (f"; {status(r, models, disk)}" if e.get("make_bits") else ""))
-            if not args.yes and ask("Prepare it now? [Y/n] ", "y").lower() not in ("y", "yes"):
+            if not (args.yes or args.dry_run) and ask("Prepare it now? [Y/n] ", "y").lower() not in ("y", "yes"):
                 return
             if args.dry_run:
                 print("(dry run: nothing downloaded)")
@@ -2368,7 +2389,7 @@ def serve(args, e, d, s, est, variant, unattended, shown=None):
             pass
         else:
             terminal_chat(f"http://127.0.0.1:{port}")
-            print("The server keeps running for the browser and other apps. Ctrl+C stops it.")
+            print(f"The server keeps running for the browser and other apps. Stop it: {stop_hint()}")
         proc.wait()
         if watch:
             watch.stop()
