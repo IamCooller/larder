@@ -286,8 +286,23 @@ def _gpu_busy():
     return float(max(vals)) if vals else None
 
 
-def _nvidia_busy():
-    """Percent of the GPU in use, from nvidia-smi, or None without one."""
+def _nvidia_busy(pmon=None):
+    """Percent of the GPU other processes use, from nvidia-smi pmon's per-process SM share with this process
+    group's own (the launcher and its server) left out, else the whole GPU's use, or None without nvidia-smi."""
+    mine, busy, seen = os.getpgid(0), 0.0, False
+    for ln in (_run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"]) if pmon is None else pmon).splitlines():
+        p = ln.split()
+        if len(p) < 4 or p[0].startswith("#") or not p[1].isdigit():
+            continue
+        seen = True
+        try:
+            if os.getpgid(int(p[1])) == mine:
+                continue
+        except OSError:
+            pass
+        busy += float(p[3]) if p[3].replace(".", "", 1).isdigit() else 0.0
+    if seen:
+        return busy
     txt = _run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
     vals = [float(v) for v in re.findall(r"^\s*(\d+(?:\.\d+)?)\s*$", txt, re.M)]
     return max(vals) if vals else None
@@ -443,6 +458,22 @@ def _write_uncached(path, size):
 
 
 # ---------------------------------------------------------------- settings
+
+def kernel_dir(p):
+    """MLX's CUDA kernel cache folder for MLX_PTX_CACHE_DIR, or None off CUDA: MLX names a cached file by the kernel
+    alone, so the folder is keyed by what the file also depends on (MLX's version, the GPU, the driver, nvrtc)."""
+    if p.get("backend") != "cuda":
+        return None
+    drv = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).splitlines()
+    try:
+        from importlib.metadata import distributions
+        nvrtc = sorted(f"{d.metadata['Name']}={d.version}" for d in distributions()
+                       if (d.metadata["Name"] or "").lower().startswith("nvidia-cuda-nvrtc"))
+    except Exception:
+        nvrtc = []
+    key = json.dumps([p.get("mlx"), p.get("gpu"), drv[:1], nvrtc])
+    return CACHE / "mlx-kernels" / f"{p.get('mlx')}-{hashlib.sha1(key.encode()).hexdigest()[:12]}"
+
 
 def _cuda_home():
     """A CUDA toolkit with headers, for MLX's run-time kernel compiler (nvrtc)."""

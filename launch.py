@@ -20,6 +20,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+import engine_log   # noqa: F401  (sets MLX's CUDA environment before anything imports MLX)
 import defaults
 import engine_version
 import library
@@ -488,12 +489,14 @@ def mark_ready(d, e):
                                                 indent=1))
 
 
-def validate(port):
-    """One short reply from a freshly made variant, or the reason it failed."""
+def validate(port, max_tokens=24, warm=False, api_key=None):
+    """One short reply (text, "") or (None, the reason it failed): the check of a freshly made variant and,
+    marked `warm`, the warm-up every start runs before it says ready, which the server's counters leave out."""
     body = json.dumps({"messages": [{"role": "user", "content": "Say hello in one short sentence."}],
-                       "max_tokens": 24}).encode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", body,
-                                 {"Content-Type": "application/json"})
+                       "max_tokens": max_tokens}).encode()
+    headers = {"Content-Type": "application/json", **({"X-Warmup": "1"} if warm else {}),
+               **({"Authorization": "Bearer " + api_key} if api_key else {})}
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", body, headers)
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             text = json.load(r)["choices"][0]["message"]["content"]
@@ -890,6 +893,10 @@ def engine_plan(e, prof, disk, tight=False, native=True, d=None):
     elif head.get("note"):
         s["why"].append(head["note"])
     s["mtp"] = head
+    kd = machine.kernel_dir(p)
+    if kd and "MLX_PTX_CACHE_DIR" not in os.environ:
+        # MLX's default is /tmp/mlx, which a reboot empties: ~90 s of kernel builds again on the PC.
+        s["env"]["MLX_PTX_CACHE_DIR"] = str(kd)
     return s, machine.estimate(p, f, s, disk)
 
 
@@ -964,9 +971,20 @@ def live_status(port, timeout=2.0):
         return None
 
 
-def speed_text(st, est=None):
+def speed_ref(e, est, backend):
+    """What the Speed line compares with before replies are timed: the estimate, except on CUDA, whose bandwidth
+    model misses the resident MTP recipe (~57 against ~147 tok/s measured on the PC): there this computer's own
+    earlier replies of the model (library.lookup), else no number."""
+    if backend != "cuda":
+        return est
+    m = library.lookup(e["facts"])
+    return ({"tps": m["tps"], "label": f"measured here before, {m['n']} replies"} if m
+            else {"tps": None, "label": "not measured yet"})
+
+
+def speed_text(st, est=None, label=None):
     """One line: the speed the server measured over its replies, beside the estimate in tok/s the
-    launcher made before them, and what else is going on."""
+    launcher made before them (or what `label` says it is), and what else is going on."""
     n = (st or {}).get("decode_replies") or 0
     tps = (st or {}).get("decode_tok_s")
     if n and tps:
@@ -974,8 +992,10 @@ def speed_text(st, est=None):
     else:
         text = "no reply timed yet"
     if est:
-        was = f"~{est:.0f} tok/s estimate"
-        text += f" (the {was})" if n else f"; the {was} for this computer"
+        was = f"~{est:.0f} tok/s {label or 'estimate'}"
+        text += f" (the {was})" if n else f"; the {was} for this computer" if not label else f"; {was}"
+    elif label and not n:
+        text += f"; speed {label} on this computer"
     cond = (st or {}).get("conditions_text")
     return text + (f" · {cond}" if cond else "")
 
@@ -984,9 +1004,9 @@ class SpeedWatch(threading.Thread):
     """A line under the banner that the running server keeps honest: the measured speed once it has
     timed replies, the estimate before that."""
 
-    def __init__(self, port, est=None, every=3.0):
+    def __init__(self, port, est=None, every=3.0, label=None):
         super().__init__(daemon=True)
-        self.port, self.est, self.every = port, est, every
+        self.port, self.est, self.every, self.label = port, est, every, label
         self._stop = threading.Event()
         self.tty = sys.stdout.isatty()
         self.seen = None
@@ -1000,7 +1020,7 @@ class SpeedWatch(threading.Thread):
             if n < 1 or n == self.seen:
                 continue
             self.seen = n
-            text = "Speed        " + speed_text(st, self.est)
+            text = "Speed        " + speed_text(st, self.est, self.label)
             if self.tty:
                 print("\r" + fit_line(text), end="", flush=True)
             else:
@@ -1035,7 +1055,7 @@ def record_server(e, d, port, proc, log, est=None, mtp=False):
         "started": time.strftime("%Y-%m-%d %H:%M:%S"), "log": str(log),
         "est": (est or {}).get("tps"), "est_lo": (est or {}).get("lo_tps"),
         "est_hi": (est or {}).get("hi_tps"), "est_runs": (est or {}).get("runs", 0),
-        "mtp": bool(mtp), "cond": machine.conditions()}, indent=1))
+        "est_label": (est or {}).get("label"), "mtp": bool(mtp), "cond": machine.conditions()}, indent=1))
 
 
 def clear_server(pid=None):
@@ -1091,8 +1111,8 @@ def show_status():
     print(f"  Model        {st.get('model')}")
     print(f"  Started      {st.get('started')}   (process {st['pid']}, port {st['port']})")
     live = live_status(st["port"])
-    print(f"  Speed        {speed_text(live or {}, st.get('est'))}")
-    if st.get("est") and live and not live.get("decode_replies"):
+    print(f"  Speed        {speed_text(live or {}, st.get('est'), st.get('est_label'))}")
+    if st.get("est") and not st.get("est_label") and live and not live.get("decode_replies"):
         print(f"  Estimate     {tui.estimate_text(st['est'], st.get('est_lo'), st.get('est_hi'), st.get('est_runs'))}")
     if st.get("mtp"):
         print("  MTP head     its own head is used, about 25% more tokens a second")
@@ -1225,7 +1245,11 @@ def delete_cli(args):
 
 def short_banner(name, port, est=None):
     """The whole output of an unattended run: where the chat is and how to stop it."""
-    speed = f"   ({tui.estimate_text(est['tps'], est.get('lo_tps'), est.get('hi_tps'), est.get('runs'))})" if est else ""
+    if est and est.get("label"):
+        tps = f"~{est['tps']:.0f} tok/s " if est["tps"] else ""
+        speed = f"   ({tps}{est['label']})"
+    else:
+        speed = f"   ({tui.estimate_text(est['tps'], est.get('lo_tps'), est.get('hi_tps'), est.get('runs'))})" if est else ""
     base = f"http://127.0.0.1:{port}"
     print(f"""
 
@@ -1267,18 +1291,77 @@ def offer_refresh(d, t):
             print(f"  not refreshed: {err}")
 
 
-def start_server(d, s, port, log, quiet=False, host="127.0.0.1", api_key=None):
-    cmd = [sys.executable, str(HERE / "server.py"), "--model", str(d), "--port", str(port),
-           "--host", host] + s["args"]
-    if api_key:
-        cmd += ["--api-key", api_key]
+def tune_once(d):
+    """The cached first-run tuning of model folder d, measured now when there is none, except in a served CUDA
+    process (machine.KEY set), where measuring would import MLX and hold a CUDA context beside the server."""
     t = tuner.load(d)
-    if t is None and Path(d, "experts.bin").exists():
+    if t is None and not machine.KEY and Path(d, "experts.bin").exists():
         print("\nFirst run of this model on this machine: measuring the disk (under 2 minutes, once).", flush=True)
         try:
             t = tuner.tune(d, lp=sys.modules[__name__])
         except Exception as ex:                  # tuning is a convenience: never block a start
             print(f"  tuning skipped: {ex}", flush=True)
+    return t
+
+
+def start_seconds(d, took=None):
+    """Seconds this computer's last start of model folder d took to ready, saved first when `took` is given."""
+    f = cache_file("starts.json")
+    data = load_json(f) or {}
+    key = f"{machine.fingerprint()} {d}"
+    if took is not None:
+        data[key] = round(took, 1)
+        machine.CACHE.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(data, indent=1))
+    return data.get(key)
+
+
+def kernel_cache(s):
+    """Whether MLX's kernel folder in the plan (MLX_PTX_CACHE_DIR under mlx-kernels/) is empty, so this start builds
+    every kernel, None without such a folder; the folder is made and the folders of other keys beside it removed."""
+    d = s.get("env", {}).get("MLX_PTX_CACHE_DIR")
+    if not d or Path(d).parent.name != "mlx-kernels":
+        return None
+    d = Path(d)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    for old in d.parent.iterdir():
+        if old != d and old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+    d.mkdir(exist_ok=True)
+    return not any(d.iterdir())
+
+
+def start_note(last, kernels=None):
+    """What a start says while the engine loads and warms up; `kernels`: MLX's kernel folder is empty (True), kept
+    (False) or not ours (None, Metal)."""
+    if last and not kernels:
+        return f"  about {last:.0f} s to ready, as the last start here took"
+    if kernels and last:
+        return ("  first start with this GPU driver and MLX: the engine builds its GPU kernels once and keeps them "
+                "for later starts, then answers one short warm-up message")
+    if kernels is False:
+        return "  loading the model, then one short warm-up message (its GPU kernels are kept from an earlier start)"
+    return ("  first start of this model on this computer: the engine measures the GPU and builds its kernels "
+            "once, then answers one short warm-up message (later starts are shorter)")
+
+
+def warm_up(port, api_key=None):
+    """One short reply before ready, so the engine's first-use work (kernel builds, its store's fill, the MTP
+    rounds' warm-up) is not the user's first message; a failure is said and never stops the start."""
+    t = time.time()
+    print("\n  warming up: one short reply...", end="", flush=True)
+    text, why = validate(port, max_tokens=8, warm=True, api_key=api_key)
+    ok = text is not None or why == "an empty reply"     # 8 tokens of thinking leave no answer, and that is fine
+    print(f" {time.time() - t:.0f} s" if ok else f" failed ({why})", flush=True)
+    return ok
+
+
+def start_server(d, s, port, log, quiet=False, host="127.0.0.1", api_key=None):
+    cmd = [sys.executable, str(HERE / "server.py"), "--model", str(d), "--port", str(port),
+           "--host", host] + s["args"]
+    if api_key:
+        cmd += ["--api-key", api_key]
+    t = tune_once(d)
     offer_refresh(d, t)
     # The tuned read-path knobs rank below the user's environment and the plan's own.
     env = {**((t or {}).get("env", {})), **os.environ, **s["env"], "PYTHONUNBUFFERED": "1", "MOE_TUNED": "1"}
@@ -1312,7 +1395,7 @@ def banner(name, model_id, port, est, mtp=None):
     base = f"http://127.0.0.1:{port}"
     st = live_status(port) or {}
     est_tps = est.get("tps") if est else None
-    speed = speed_text(st, est_tps)
+    speed = speed_text(st, est_tps, (est or {}).get("label"))
     cond = st.get("conditions_text") or machine.conditions_text(machine.conditions())
     print(f"""
 
@@ -1581,6 +1664,8 @@ class TuiBackend(tui.Backend):
                 time.sleep(1)
             if time.time() - t0 > 3600:
                 raise RuntimeError(f"the engine did not answer in an hour; log: {self.log}")
+        job.say("warming up: one short reply, so the first message does not wait for the engine's first-use work")
+        validate(port, max_tokens=8, warm=True)
         if e.get("make_bits") and not is_ready(d):          # made here: offered once it has answered
             job.say("checking the copy made here with one short reply")
             text, why = validate(port)
@@ -2116,7 +2201,7 @@ def main():
         p = json.loads(Path(args.serve).read_text())
         Path(args.serve).unlink()
         machine.KEY[:] = [p["fp"]]             # the machine's key as read before exec: reading it again imports MLX
-        return serve(args, p["e"], Path(p["d"]), p["s"], p["est"], p["variant"], p["unattended"])
+        return serve(args, p["e"], Path(p["d"]), p["s"], p["est"], p["variant"], p["unattended"], p.get("shown"))
     # ./larder with nothing else opens the full-screen menu, while a script without a terminal and
     # --dry-run get the recommended model with no questions.
     if not (args.model or args.search or args.list or args.pick or args.auto):
@@ -2219,25 +2304,33 @@ def main():
                                "--model", str(d), "--port", str(port), *s["args"]]))
         print("why: " + "; ".join(s["why"]))
         return
+    shown = speed_ref(e, est, prof["backend"])
     if prof["backend"] == "cuda" and "mlx.core" in sys.modules:
-        # Importing MLX holds a CUDA context (128 MiB of VRAM) for this process's life: serve from a fresh process.
+        # Importing MLX holds a CUDA context (128 MiB of VRAM) for this process's life: serve from a fresh process,
+        # with the first run's disk tuning done here, since it reads the machine through MLX.
+        tune_once(d)
         plan = cache_file(f"serve-{os.getpid()}.json")
         plan.write_text(json.dumps({"e": e, "d": str(d), "s": s, "est": est, "variant": variant, "unattended": unattended,
-                                    "fp": machine.fingerprint()}))
+                                    "fp": machine.fingerprint(), "shown": shown}))
         sys.stdout.flush()
         os.execv(sys.executable, [sys.executable, str(HERE / "launch.py"), *sys.argv[1:], "--serve", str(plan)])
-    serve(args, e, d, s, est, variant, unattended)
+    serve(args, e, d, s, est, variant, unattended, shown)
 
 
-def serve(args, e, d, s, est, variant, unattended):
-    """Start the planned server and stay with it: banner, chat or speed watch, and stop it on exit."""
+def serve(args, e, d, s, est, variant, unattended, shown=None):
+    """Start the planned server and stay with it: banner, chat or speed watch, and stop it on exit; `shown` is
+    what the Speed line compares with before replies are timed (speed_ref), the estimate when None."""
     port = args.port
+    shown = est if shown is None else shown
     note_estimate(e, d, est, s)
     machine.CACHE.mkdir(parents=True, exist_ok=True)
     log = machine.CACHE / f"server-{time.strftime('%Y%m%d-%H%M%S')}.log"
     if server_info()[1]:                       # one model at a time, on the one chat port
         stop_server()
+    cold = kernel_cache(s)
     proc = start_server(d, s, port, log, quiet=unattended, host=args.host, api_key=args.api_key)
+    t0 = time.time()
+    print(start_note(start_seconds(d), cold), flush=True)
 
     def stop(*_):
         if proc.poll() is None:
@@ -2250,22 +2343,24 @@ def serve(args, e, d, s, est, variant, unattended):
     signal.signal(signal.SIGTERM, stop)
     try:
         model_id = wait_ready(proc, port, log, api_key=args.api_key)
+        if warm_up(port, args.api_key) and not cold:     # a start that built the kernels is no guide to the next
+            start_seconds(d, time.time() - t0)
         if e.get("make_bits") and not is_ready(d):    # made here: offered once it has answered
-            text, why = validate(port)
+            text, why = validate(port, api_key=args.api_key)
             if text is None:
                 raise SystemExit(f"\nThe {e['name']} copy failed its check ({why}); it is not offered. "
                                  f"Its files: {d}")
             mark_ready(d, e)
             print(f"\n  checked: it answered \"{text.strip()[:60]}\"")
         remember(e, variant)
-        record_server(e, d, port, proc, log, est, bool(s.get("mtp", {}).get("path")))
+        record_server(e, d, port, proc, log, shown, bool(s.get("mtp", {}).get("path")))
         if unattended:
-            short_banner(e["name"], port, est)
+            short_banner(e["name"], port, shown)
         else:
-            banner(e["name"], model_id, port, est, s.get("mtp"))
+            banner(e["name"], model_id, port, shown, s.get("mtp"))
         watch = None
         if unattended or args.no_chat:
-            watch = SpeedWatch(port, est["tps"] if est else None)
+            watch = SpeedWatch(port, shown["tps"] if shown else None, label=(shown or {}).get("label"))
             watch.start()
         if not args.no_browser:
             webbrowser.open(f"http://127.0.0.1:{port}/")

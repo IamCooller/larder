@@ -8,6 +8,8 @@ PRELUDE = r"""
 #define FN __device__ __forceinline__
 #define CFN __host__ __device__ constexpr
 #define H2F(u) __half2float(__ushort_as_half((unsigned short)(u)))
+#define U2F(u) __uint_as_float((unsigned int)(u))
+#define F2U(f) __float_as_uint((float)(f))
 #define SHFL(v, m) __shfl_xor_sync(0xffffffffu, v, m)
 #define POPC(v) __popc(v)
 #define EXP(v) expf(v)

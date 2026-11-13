@@ -22,9 +22,14 @@ it in a container or a throwaway VM.
 
 --n takes the first N items of each file. If the two servers do not fit in memory together, run each
 arm alone with --arm OUT.json (pass that arm's URL as --baseline), then pair the two files with --compare.
+
+--prefix FILE --prefix-tokens N --tokenizer tokenizer.json puts an N-token window of FILE's text before each item,
+then a separator line, then the item unchanged, so every item's prompt is long. The window's start is a hash of the
+benchmark and the item's index: both arms see the same window for an item and no two items share a prompt prefix.
 """
 import argparse
 import gzip
+import hashlib
 import json
 import math
 import re
@@ -40,6 +45,7 @@ HE_PROMPT = ("Complete the following Python function. Reply with the complete fu
              "signature included, in one ```python code block and nothing else.\n\n"
              "```python\n{prompt}```")
 MAX_TOKENS = {"gsm8k": 512, "humaneval": 500}
+PREFIX_SEP = "\n\n-----\n\n"
 ALPHA = 0.05
 
 
@@ -100,6 +106,18 @@ def items(bench, path, n):
     return [(HE_PROMPT.format(prompt=r["prompt"]),
              lambda reply, r=r: run_tests(extract_code(reply, r["prompt"], r["entry_point"]),
                                           r["test"], r["entry_point"])) for r in rows]
+
+
+def prefixer(ids, n, decode):
+    """(bench, index) -> an n-token window of the token ids `ids`, decoded, at a start hashed from both."""
+    room = len(ids) - n + 1
+    if n < 1 or room < 1:
+        raise ValueError(f"the prefix text has {len(ids)} tokens, fewer than --prefix-tokens {n}")
+
+    def window(bench, i):
+        start = int(hashlib.sha256(f"{bench}/{i}".encode()).hexdigest(), 16) % room
+        return decode(ids[start:start + n])
+    return window
 
 
 def ask(base, model, text, max_tokens, no_thinking, timeout):
@@ -173,10 +191,12 @@ def line(name, t):
     return row
 
 
-def collect(base, model, bench, path, n, no_thinking, timeout):
-    """Replies are scored as they arrive: [bool] for one endpoint."""
+def collect(base, model, bench, path, n, no_thinking, timeout, prefix=None):
+    """Replies are scored as they arrive: [bool] for one endpoint; `prefix` is a prefixer() window or None."""
     hits = []
     for i, (text, score) in enumerate(items(bench, path, n)):
+        if prefix:
+            text = prefix(bench, i) + PREFIX_SEP + text
         hits.append(bool(score(ask(base, model, text, MAX_TOKENS[bench], no_thinking, timeout))))
         print(f"  {bench} {i + 1}: {sum(hits)}/{len(hits)}", end="\r", file=sys.stderr)
     print(file=sys.stderr)
@@ -228,7 +248,18 @@ def main():
     ap.add_argument("--compare", nargs=2, metavar=("BASE.json", "CAND.json"), help="pair two files saved with --arm")
     ap.add_argument("--margin", type=float, help="non-inferiority margin, e.g. 0.03: PASS only if the pooled CI lower bound is above -margin")
     ap.add_argument("--json", help="write the table and verdict here")
+    ap.add_argument("--prefix", metavar="FILE", help="long text whose windows go before each item")
+    ap.add_argument("--prefix-tokens", type=int, default=8192, help="window length in tokens (default 8192)")
+    ap.add_argument("--tokenizer", help="the model's tokenizer.json, which counts the window's tokens")
     a = ap.parse_args()
+    prefix = None
+    if a.prefix:
+        if not a.tokenizer:
+            ap.error("--prefix needs --tokenizer")
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(a.tokenizer)
+        ids = tok.encode(Path(a.prefix).read_text(encoding="utf-8"), add_special_tokens=False).ids
+        prefix = prefixer(ids, a.prefix_tokens, tok.decode)
     benches = [(b, p) for b, p in (("gsm8k", a.gsm8k), ("humaneval", a.humaneval)) if p]
     if a.compare:
         A, B = (json.loads(Path(p).read_text()) for p in a.compare)
@@ -237,14 +268,14 @@ def main():
         if not benches or not a.baseline:
             ap.error("give --baseline and at least one of --gsm8k, --humaneval (or --compare)")
         if a.arm:
-            hits = {b: collect(a.baseline, a.model, b, p, a.n, a.no_thinking, a.timeout) for b, p in benches}
+            hits = {b: collect(a.baseline, a.model, b, p, a.n, a.no_thinking, a.timeout, prefix) for b, p in benches}
             Path(a.arm).write_text(json.dumps(hits))
             print("saved", a.arm)
             return 0
         if not a.candidate:
             ap.error("--candidate is needed (or use --arm / --compare)")
-        runs = {b: (collect(a.baseline, a.model, b, p, a.n, a.no_thinking, a.timeout),
-                    collect(a.candidate, a.model, b, p, a.n, a.no_thinking, a.timeout)) for b, p in benches}
+        runs = {b: (collect(a.baseline, a.model, b, p, a.n, a.no_thinking, a.timeout, prefix),
+                    collect(a.candidate, a.model, b, p, a.n, a.no_thinking, a.timeout, prefix)) for b, p in benches}
     rows, verdict = report(runs, a.margin)
     print_report(rows, verdict, a.margin)
     if a.json:

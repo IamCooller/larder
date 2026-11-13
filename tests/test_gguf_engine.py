@@ -51,7 +51,15 @@ PROJ = ("gate_proj", "up_proj", "down_proj")
 # weights are alike in size as a real pack's are (the K-quants' 6-bit sub-scales otherwise make theirs 10-100x
 # larger, and the toy then turns router near-ties into flips).
 REACH = {"Q4_K": 945, "Q5_K": 1953, "Q5_1": 31, "Q5_0": 16, "Q8_0": 127, "Q2_0": 2, "IQ4_NL": 127,
-         "IQ4_XS": 3937, "IQ3_XXS": 480, "IQ2_S": 166}
+         "IQ4_XS": 3937, "IQ3_XXS": 480, "IQ2_S": 166, "Q6_K": 4064, "Q3_K": 128, "Q2_K": 45, "IQ2_XXS": 166,
+         "IQ2_XS": 166, "IQ3_S": 465, "IQ1_M": 17, "IQ1_S": 17, "TQ2_0": 2, "TQ1_0": 1, "Q1_0": 1, "F16": 4,
+         "BF16": 4, "F32": 4}
+# Two more toys for the 17 types added after the first twelve (the expert width, 128, rules out 256-weight blocks
+# for down); MXFP4, NVFP4 and F8_E4M3 take random_experts' own scale ranges.
+NEW_MIXES = ([("Q6_K", "Q3_K", "MXFP4"), ("Q2_K", "IQ2_XXS", "Q1_0"), ("IQ3_S", "IQ1_M", "BF16"),
+              ("IQ2_XS", "TQ2_0", "F16")],
+             [("IQ1_S", "TQ1_0", "NVFP4"), ("F32", "F8_E4M3", "F16"), ("BF16", "F16", "F8_E4M3"),
+              ("Q6_K", "Q6_K", "Q8_0")])
 _rng = np.random.default_rng(5)
 PASSES = [_rng.integers(0, 200, 24).tolist(), [5], [77], [131], [9, 42], _rng.integers(0, 200, 24).tolist()]
 BAR = 2 ** -7
@@ -93,7 +101,7 @@ def build(out):
         ref[L] = {}
         for p, t in zip(PROJ, types):
             rows, length = (inter, hid) if p != "down_proj" else (hid, inter)
-            raw = ge.random_experts(rng, E, rows, length, t, scale=0.02 / REACH[t])
+            raw = ge.random_experts(rng, E, rows, length, t, scale=0.02 / REACH.get(t, 1))
             ref[L][p] = np.stack([ge.ref_dequant(raw[e], t).reshape(rows, length) for e in range(E)])
             tensors.append((f"blk.{L}.ffn_{p.split('_')[0]}_exps.weight", [length, rows, E], ge.TYPES[t][0],
                             raw.tobytes()))
@@ -162,9 +170,29 @@ def check_engine(out, ref_logits, name, **kw):
     del model
     gc.collect()
     mx.clear_cache()
+    return got
+
+
+def check_refusal():
+    """An index whose layer holds a type the engine does not decode is refused at load in one sentence that names
+    the file and the type."""
+    class Fd:
+        name = "/models/x/experts.bin"
+    base = "model.layers.3.mlp.switch_mlp."
+    index = {base + p: {"parts": [{"name": "gguf", "ggml_type": t}]}
+             for p, t in zip(PROJ, ("Q4_K", "Q4_K", "Q8_K"))}
+    try:
+        stream_fast._gguf_types({"index": index, "fd": Fd()}, base + "gate_proj")
+        raise SystemExit("Q8_K was accepted at load")
+    except ValueError as e:
+        assert Fd.name in str(e) and "Q8_K" in str(e) and str(e).count(". ") == 0, e
+        print(f"refused at load: {e}")
+    index[base + "down_proj"]["parts"][0]["ggml_type"] = "Q6_K"
+    assert stream_fast._gguf_types({"index": index, "fd": Fd()}, base + "gate_proj") == "Q4_K/Q4_K/Q6_K"
 
 
 def main():
+    check_refusal()
     mx.set_cache_limit(0)
     stream_fast.phys_footprint = lambda: mx.get_active_memory() + mx.get_cache_memory()
     # Both paths in every arm: dense wherever the host has the rows (the toy's own costs would pick otherwise).
@@ -172,16 +200,22 @@ def main():
     ge.dense_pays = lambda u, p: True
     ge.gemv = counted("gemv", ge.gemv)
     ge.dense = counted("dense", ge.dense)
+    global MIXES
     tmp = Path(tempfile.mkdtemp(prefix="gguf_"))
     try:
-        out = tmp / "toy"
-        ref = run_passes(reference(out, build(out)))
-        gc.collect()
-        peak = mx.get_active_memory() / 1e9 + 1.0
-        check_engine(out, ref, "per-layer arena")
-        check_engine(out, ref, "run-ahead", defer=True)
-        check_engine(out, ref, "budget store", peak_gb=peak)
-        check_engine(out, ref, "budget store, layer-major prefill", peak_gb=peak, lm=True)
+        for i, MIXES in enumerate([MIXES, *NEW_MIXES]):
+            out = tmp / f"toy{i}"
+            ref = run_passes(reference(out, build(out)))
+            gc.collect()
+            peak = mx.get_active_memory() / 1e9 + 1.0
+            check_engine(out, ref, "per-layer arena")
+            check_engine(out, ref, "run-ahead", defer=True)
+            tm = check_engine(out, ref, "budget store", peak_gb=peak)
+            lm = check_engine(out, ref, "budget store, layer-major prefill", peak_gb=peak, lm=True)
+            # Layers whose gate / up / down records differ in size: the layer-major staging gives the same bits.
+            assert all(np.array_equal(a.view(np.uint32), b.view(np.uint32)) for a, b in zip(tm, lm)), \
+                "layer-major prefill differs from the token-major budget store"
+            print("layer-major prefill bit-equal to the token-major budget store")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("all GGUF engine checks passed")

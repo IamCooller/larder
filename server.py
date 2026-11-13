@@ -12,6 +12,7 @@ import socket
 import ssl
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 # The launcher's start (MOE_TUNED=1 or --tuned) applies the cached first-run tuning here, before the engine
 # modules read the environment; a raw command is untouched and any failure starts the server untuned.
 import sys
+
+import engine_log   # noqa: F401  (sets MLX's CUDA environment before anything imports MLX)
 try:
     import tuner
     if tuner.opted_in(sys.argv) and tuner.model_from_argv(sys.argv):
@@ -113,6 +116,8 @@ class Counters:
 
     def add(self, info):
         """`info` is what the worker filled for one reply (ModelHost._count)."""
+        if info.get("warmup"):              # the launcher's warm-up reply is no user's
+            return
         n, ttft, dec_s = info.get("completion_tokens") or 0, info.get("ttft_s"), info.get("decode_s") or 0.0
         with self.lock:
             self.requests += 1
@@ -562,6 +567,8 @@ class ModelHost:
 
     def _measure(self, info):
         """A reply that ran alone, into the model's measured speed (library.record); never a reason to fail it."""
+        if info.get("warmup"):
+            return
         try:
             library.record(self.model_name, info.get("completion_tokens"), info.get("decode_s"))
         except Exception as e:
@@ -1295,7 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
                                      model_id, tools, response_format, sampling,
                                      usage_chunk, think, think_on)
         else:
-            info = {}
+            # X-Warmup: 1 marks the launcher's warm-up reply, which the counters and measured speeds leave out.
+            info = {"warmup": True} if self.headers.get("X-Warmup") == "1" else {}
             try:
                 text = self.host.generate(messages, max_tokens, stream=False,
                                           tools=tools,
@@ -1303,6 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
                                           sampling=sampling, info=info, thinking=think,
                                           client_gone=self.client_gone)
             except Exception as e:
+                traceback.print_exc()
                 self._error(503, f"generation failed: {e}")
                 return
             # Without tools the reply is the client's verbatim, so a client that keeps its own tool sheet in the prompt never gets content "" and finish "stop" from a block the parser cannot read.
@@ -1371,6 +1380,7 @@ class Handler(BaseHTTPRequestHandler):
             # Start the generator before the 200 goes out, so a missing model raises while the status can still change.
             first = next(pieces, "")
         except Exception as e:
+            traceback.print_exc()
             self._error(503, f"generation failed: {e}")
             return
 
@@ -1449,6 +1459,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             # The engine failed after the 200 went out: an error event is the
             # only way left to say so, and OpenAI clients read this shape.
+            traceback.print_exc()
             try:
                 self.wfile.write(sse({"error": {"message": f"generation failed: {e}",
                                                 "type": "server_error"}}))

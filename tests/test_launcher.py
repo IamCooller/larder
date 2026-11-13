@@ -1388,16 +1388,17 @@ def check_cuda_serve_exec(tmp):
             except Exec:
                 pass
             if backend == "metal":
-                assert "argv" not in calls and calls["serve"][1:] == (e, d, s, est, "published", False), calls
+                assert "argv" not in calls and calls["serve"][1:] == (e, d, s, est, "published", False, est), calls
         argv = calls["argv"]
         assert "serve" not in calls and argv[1].endswith("launch.py") and argv[2:-2] == sys.argv[1:] and argv[-2] == "--serve"
         plan = json.loads(Path(argv[-1]).read_text())
         assert (plan["e"]["id"], plan["d"], plan["s"], plan["est"]) == ("m", str(d), s, est)
-        assert plan["fp"] == machine.fingerprint()
+        assert plan["fp"] == machine.fingerprint() and plan["shown"] == {"tps": None, "label": "not measured yet"}
         calls.clear()
         sys.argv = ["launch.py", "--serve", argv[-1]]
         launch.main()                              # the fresh process: straight to serving, the plan file read once
-        assert calls["serve"][1:] == (plan["e"], d, s, est, "published", False) and not Path(argv[-1]).exists()
+        assert calls["serve"][1:] == (plan["e"], d, s, est, "published", False, plan["shown"])
+        assert not Path(argv[-1]).exists()
         real_facts = machine.facts                 # its key comes from the plan: facts (and MLX) are never read
         machine.facts = lambda: (_ for _ in ()).throw(AssertionError("facts read in the served process"))
         assert machine.KEY == [plan["fp"]] and machine.fingerprint() == plan["fp"]
@@ -1407,6 +1408,191 @@ def check_cuda_serve_exec(tmp):
         machine.profile, machine.ssd, launch.pick, launch.judge, launch.engine_plan, launch.serve, os.execv, sys.argv = saved
     print("25. CUDA start serves from a fresh process (exec with --serve and the plan), so the launcher holds no "
           "CUDA context beside its server; Metal serves in place")
+
+
+def check_first_reply(tmp):
+    """The first start's first-use work goes to a warm-up reply before ready, which the server's counters and
+    measured speeds leave out; the Speed line's reference on CUDA is a measured speed or none; our own server is
+    not "other apps" on the GPU; a served CUDA process never tunes (tuning imports MLX), the launcher tunes first."""
+    import contextlib
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import library
+    import server
+    import tui
+    # 26. the warm-up: one 8-token reply marked X-Warmup, said and timed; a failed one never stops the start
+    got = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            got.append((self.headers.get("X-Warmup"), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            body = json.dumps({"choices": [{"message": {"content": ""}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            assert launch.warm_up(srv.server_address[1])                # an empty answer (all thinking) is fine
+            assert not launch.warm_up(srv.server_address[1] + 1)        # nothing there: said, not raised
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert got[0][0] == "1" and got[0][1]["max_tokens"] == 8, got
+    assert "warming up: one short reply..." in out.getvalue() and "failed (no reply" in out.getvalue(), out.getvalue()
+    # the server leaves it out of /status and of the measured speeds; decode speed is tokens after the first over
+    # the time after the first token, so a slow first token does not lower it
+    c = server.Counters()
+    c.add({"warmup": True, "completion_tokens": 8, "ttft_s": 100.0, "decode_s": 10.0})
+    assert c.report()["requests"] == 0 and c.report()["decode_tok_s"] is None and not c.history()
+    c.add({"completion_tokens": 201, "ttft_s": 30.0, "decode_s": 2.0})
+    r = c.report()
+    assert (r["requests"], r["decode_tok_s"], r["decode_replies"], r["first_token_last_s"]) == (1, 100.0, 1, 30.0), r
+    recorded, real_record = [], server.library.record
+    server.library.record = lambda *a: recorded.append(a)
+    try:
+        host = server.ModelHost.__new__(server.ModelHost)
+        host.model_name = "m"
+        host._measure({"warmup": True, "completion_tokens": 100, "decode_s": 1.0})
+        host._measure({"completion_tokens": 100, "decode_s": 1.0})
+    finally:
+        server.library.record = real_record
+    assert recorded == [("m", 100, 1.0)], recorded
+    # what a start says while it loads: the last start's time here, or that this is the first
+    d = tmp / "starts_model"
+    assert launch.start_seconds(d) is None and "first start of this model on this computer" in launch.start_note(None)
+    assert launch.start_seconds(d, 41.26) == 41.3 and launch.start_seconds(d) == 41.3
+    assert launch.start_note(41.3) == "  about 41 s to ready, as the last start here took"
+    print("26. a start warms up with one 8-token reply (X-Warmup) before ready, which /status and the measured "
+          "speeds leave out; decode speed excludes the first token's wait; the wait says the last start's time")
+
+    # 27. the Speed line's reference: the estimate on Metal; on CUDA a speed measured here before, else no number
+    e, est = {"facts": {"kind": "moe"}}, {"tps": 57.0, "lo_tps": 50.0, "hi_tps": 57.0, "runs": 0}
+    real_lookup = library.lookup
+    try:
+        library.lookup = lambda f: {}
+        assert launch.speed_ref(e, est, "metal") is est
+        ref = launch.speed_ref(e, est, "cuda")
+        assert ref == {"tps": None, "label": "not measured yet"}
+        assert launch.speed_text({}, ref["tps"], ref["label"]) == "no reply timed yet; speed not measured yet on this computer"
+        assert launch.speed_text({"decode_tok_s": 147.2, "decode_replies": 2}, ref["tps"], ref["label"]) == \
+            "147.2 tok/s measured over 2 replies"
+        library.lookup = lambda f: {"tps": 146.7, "n": 5, "date": "2026-11-11", "name": "m"}
+        ref = launch.speed_ref(e, est, "cuda")
+        assert launch.speed_text({}, ref["tps"], ref["label"]) == "no reply timed yet; ~147 tok/s measured here before, 5 replies"
+        assert launch.speed_text({"decode_tok_s": 140.0, "decode_replies": 1}, ref["tps"], ref["label"]) == \
+            "140.0 tok/s measured over 1 reply (the ~147 tok/s measured here before, 5 replies)"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            launch.short_banner("M", 8800, ref)
+            launch.short_banner("M", 8800, {"tps": None, "label": "not measured yet"})
+            launch.short_banner("M", 8800, est)
+        lines = [ln for ln in out.getvalue().splitlines() if "Ready:" in ln]
+        assert lines == ["  Ready: M   (~147 tok/s measured here before, 5 replies)", "  Ready: M   (not measured yet)",
+                         f"  Ready: M   ({tui.estimate_text(57.0, 50.0, 57.0, 0)})"], lines
+    finally:
+        library.lookup = real_lookup
+    print("27. Speed line before replies: the estimate on Metal; on CUDA this computer's measured replies of the "
+          "model, else 'not measured yet' (no 2.6x-off bandwidth number)")
+
+    # 28. "other apps use the GPU" counts other processes' SM share from nvidia-smi pmon, not our own server's
+    head = "# gpu         pid   type     sm    mem    enc    dec    command\n# Idx           #    C/G      %      %      %      %    name\n"
+    mine = f"    0  {os.getpid()}     C     40     12      -      -    python3\n"
+    assert machine._nvidia_busy(pmon=head + mine) == 0.0
+    assert machine._nvidia_busy(pmon=head + mine + "    0  1     G      7      1      -      -    Xorg\n") == 7.0
+    assert machine._nvidia_busy(pmon=head + f"    0  {os.getpid()}     C      -      -      -      -    python3\n") == 0.0
+    assert "GPU" not in machine.conditions_text({"gpu_busy": machine._nvidia_busy(pmon=head + mine)})
+    print("28. the GPU note counts other processes only (nvidia-smi pmon per pid, this process group left out)")
+
+    # 29. the first run on a machine: tuning (which reads the machine through MLX) happens before the exec, and a
+    # served process with no tuning cached never tunes and never imports MLX
+    models = tmp / "tune_models"
+    d = fake_folder(models / "m", {"model_type": "x"}, extra=["launcher.json", "experts.bin"])
+    e = entry(Q15, id="m", name="M")
+    order = []
+
+    class Exec(Exception):
+        pass
+    saved = (machine.profile, machine.ssd, launch.pick, launch.judge, launch.engine_plan, os.execv, sys.argv,
+             launch.tuner.load, launch.tuner.tune)
+    machine.ssd = lambda *a, **k: {"gbps": 5.0, "lat_ms": 0.1}
+    launch.pick, launch.judge = lambda *a: e, lambda *a: {"ok": True}
+    launch.engine_plan = lambda *a, **k: ({"args": [], "env": {}, "why": [], "mtp": {"path": ""}}, {"tps": 9.0})
+    launch.tuner.load = lambda d: None
+    launch.tuner.tune = lambda d, lp=None: order.append("tune") or {}
+    os.execv = lambda py, argv: order.append("exec") or (_ for _ in ()).throw(Exec())
+    machine.profile = lambda **k: {**prof("cuda"), "chip": "c", "arch": "a", "os": "o", "gpu": "g",
+                                   "now": {"avail_gb": 14.0, "disks": []}}
+    sys.argv = ["launch.py", "--model", "m", "--models-dir", str(models), "--no-browser", "--no-chat"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                launch.main()
+            except Exec:
+                pass
+    finally:
+        (machine.profile, machine.ssd, launch.pick, launch.judge, launch.engine_plan, os.execv, sys.argv,
+         launch.tuner.load, launch.tuner.tune) = saved
+    assert order == ["tune", "exec"], order
+    probe = ("import sys\n"
+             "class Block:\n"
+             "    def find_spec(self, name, path=None, target=None):\n"
+             "        if name.split('.')[0] == 'mlx':\n"
+             "            raise ImportError('mlx imported in the served process')\n"
+             "sys.meta_path.insert(0, Block())\n"
+             f"sys.path.insert(0, {str(ROOT)!r})\n"
+             "import subprocess, launch, machine\n"
+             "machine.KEY[:] = ['fp']\n"
+             f"machine.CACHE = __import__('pathlib').Path({str(tmp / 'served_cache')!r})\n"
+             "launch.tuner.tune = lambda *a, **k: sys.exit('tuned in the served process')\n"
+             "subprocess.Popen = lambda *a, **k: 'proc'\n"
+             f"assert launch.start_server({str(d)!r}, {{'args': [], 'env': {{}}}}, 8800, '/dev/null', quiet=True) == 'proc'\n"
+             "assert not [m for m in sys.modules if m.split('.')[0] == 'mlx']\n")
+    r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True, timeout=120,
+                       stdin=subprocess.DEVNULL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    print("29. first run on CUDA: the disk tuning runs before the exec, and the served process neither tunes nor "
+          "imports MLX (no CUDA context beside the server)")
+
+    # 30. MLX's CUDA kernel cache in the launcher's cache (MLX_PTX_CACHE_DIR), keyed, one key kept; Metal untouched
+    cu = {**prof("cuda"), "mlx": "0.32.4", "gpu": "NVIDIA GeForce RTX 5060 Ti"}
+    kd = machine.kernel_dir(cu)
+    assert kd.parent == machine.CACHE / "mlx-kernels" and kd.name.startswith("0.32.4-"), kd
+    assert machine.kernel_dir({**cu, "gpu": "other"}) != kd and machine.kernel_dir({**cu, "mlx": "0.33.0"}) != kd
+    assert machine.kernel_dir(prof("metal")) is None
+    e = entry(Q15, id="m", name="M")
+    real_env = os.environ.pop("MLX_PTX_CACHE_DIR", None)
+    try:
+        assert launch.engine_plan(e, cu, None, native=False)[0]["env"]["MLX_PTX_CACHE_DIR"] == str(kd)
+        assert "MLX_PTX_CACHE_DIR" not in launch.engine_plan(e, prof("metal"), None, native=False)[0]["env"]
+        os.environ["MLX_PTX_CACHE_DIR"] = str(tmp / "users_own")        # the user's own setting wins
+        assert "MLX_PTX_CACHE_DIR" not in launch.engine_plan(e, cu, None, native=False)[0]["env"]
+    finally:
+        os.environ.pop("MLX_PTX_CACHE_DIR", None)
+        if real_env is not None:
+            os.environ["MLX_PTX_CACHE_DIR"] = real_env
+    old = machine.CACHE / "mlx-kernels" / "0.32.3-aaaaaaaaaaaa"
+    old.mkdir(parents=True)
+    (old / "k.ptx").write_text("x")
+    s = {"env": {"MLX_PTX_CACHE_DIR": str(kd)}}
+    assert launch.kernel_cache(s) and kd.is_dir() and not old.exists()      # empty: built this start; old key gone
+    (kd / "k.ptx").write_text("x")
+    assert not launch.kernel_cache(s) and (kd / "k.ptx").exists()           # kept: nothing to build
+    own = tmp / "users_own"
+    own.mkdir()
+    assert launch.kernel_cache({"env": {"MLX_PTX_CACHE_DIR": str(own)}}) is None and launch.kernel_cache({"env": {}}) is None
+    assert "builds its GPU kernels once" in launch.start_note(40.2, True)
+    assert launch.start_note(40.2, False).startswith("  about 40 s")
+    assert "builds its kernels once" in launch.start_note(None, True) and "builds" in launch.start_note(None, None)
+    assert "kept from an earlier start" in launch.start_note(None, False)     # the start after a cold one
+    print("30. MLX's CUDA kernels kept in mlx-kernels/<MLX version>-<key of GPU, driver, nvrtc> (MLX_PTX_CACHE_DIR), "
+          "other keys removed, the user's own setting kept; a start with an empty folder says it builds them; "
+          "Metal sets nothing")
 
 
 def check_exl3_resume(tmp, src):
@@ -2039,6 +2225,7 @@ def main():
         check_cuda_q40(tmp)
         check_exl3_resume(tmp, src)
         check_cuda_serve_exec(tmp)
+        check_first_reply(tmp)
         library.HOME, library.volumes, machine.CACHE = real_lib[:3]
         os.environ.pop("HF_HUB_CACHE", None) if real_lib[3] is None else os.environ.__setitem__("HF_HUB_CACHE", real_lib[3])
     check_settings()

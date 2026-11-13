@@ -20,14 +20,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import quality_gate as qg
 
 
-def serve(wrong_gsm, wrong_he):
-    """A stub endpoint that answers the toy items right except the listed indices."""
+def serve(wrong_gsm, wrong_he, seen=None):
+    """A stub endpoint that answers the toy items right except the listed indices; raw request bodies go to `seen`."""
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if seen is not None:
+                seen.append(raw)
+            body = json.loads(raw)
             assert body["temperature"] == 0 and body["stream"] is False
             text = body["messages"][-1]["content"]
             if "Solve the problem" in text:
@@ -84,7 +87,41 @@ def main():
         base, b_url = serve(set(), set())
         cand, c_url = serve({0}, {3})
         bad, d_url = serve(set(range(9)), set())
+        seen = []
+        rec, r_url = serve(set(), set(), seen)
         try:
+            # Without --prefix a request is byte for byte the body the tool sent before the option existed.
+            qg.collect(r_url, "model", "gsm8k", str(gsm), 2, True, 30)
+            rows = qg.read_rows(gsm)
+            old = [json.dumps({"model": "model", "messages": [{"role": "user", "content": qg.GSM_PROMPT + r["question"]}],
+                               "temperature": 0, "max_tokens": 512, "stream": False,
+                               "chat_template_kwargs": {"enable_thinking": False}}).encode() for r in rows[:2]]
+            assert seen == old, seen
+            # With a prefix: an n-token window, the separator, then the item unchanged; the same window for an item in
+            # every run, a different one for every item and benchmark, and the scores as without it.
+            ids = list(range(5000))
+            words = lambda ids: " ".join("w%d" % i for i in ids)
+            pre = qg.prefixer(ids, 300, words)
+            seen.clear()
+            hits = qg.collect(r_url, "model", "gsm8k", str(gsm), 10, False, 30, pre)
+            hits += qg.collect(r_url, "model", "humaneval", str(he), 4, False, 30, pre)
+            assert hits == [True] * 14
+            texts = [json.loads(b)["messages"][0]["content"] for b in seen]
+            items = [t for t, _ in qg.items("gsm8k", gsm, 10)] + [t for t, _ in qg.items("humaneval", he, 4)]
+            heads = []
+            for t, item in zip(texts, items):
+                head, sep, tail = t.partition(qg.PREFIX_SEP)
+                assert sep and tail == item and len(head.split()) == 300, t[:80]
+                first = int(head.split()[0][1:])
+                assert head == words(range(first, first + 300))
+                heads.append(head)
+            assert len(set(heads)) == 14
+            assert pre("gsm8k", 3) == heads[3] and pre("humaneval", 3) == heads[13] != heads[3]
+            try:
+                qg.prefixer(ids[:100], 300, words)
+                raise AssertionError("a text shorter than the window must be refused")
+            except ValueError:
+                pass
             # Candidate loses 1 + 1 items: 2 discordant against 0, exact p 0.5, not significant.
             code, text = run("--baseline", b_url, "--candidate", c_url, "--gsm8k", str(gsm), "--humaneval", str(he),
                              "--json", str(Path(tmp) / "o.json"))
@@ -112,7 +149,7 @@ def main():
             code, text = run("--compare", str(Path(tmp) / "a.json"), str(Path(tmp) / "b.json"))
             assert code == 2 and "0.0039" in text, text
         finally:
-            for s in (base, cand, bad):
+            for s in (base, cand, bad, rec):
                 s.shutdown()
     print("test_quality_gate: ok")
 

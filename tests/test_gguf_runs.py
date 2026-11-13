@@ -2,7 +2,8 @@
 """gguf_experts' run kernels (CUDA only) against the decode chain, bit for bit, h (gate/up) and the output (down):
 
   1. random Q4_0 / Q4_1 experts at the 35B's shapes (2048, 512) in its two mixes and a Q4_1 gate/up one, a K-quant mix
-     at Flash-Next's (2560, 640), and (1440, 480) whose rows do not fill the last threadgroup;
+     at Flash-Next's (2560, 640), and (1440, 480) whose rows do not fill the last threadgroup; seven mixes at the
+     35B's shapes covering the 17 types added after the first twelve;
   2. sorted rows in runs of T = 1..16 rows a slot, mixed runs of 1 to 20, and unsorted rows;
   3. x in bf16 (and f16, f32 on the 35B's mix), out in bf16 and f32, at the default tile and two others;
   4. gemv() itself takes the run kernels there, after its own check passed.
@@ -24,6 +25,10 @@ E = 20
 MIXES = [(("Q4_0", "Q4_0", "Q4_0"), 2048, 512), (("Q4_0", "Q4_0", "Q4_1"), 2048, 512),
          (("Q4_1", "Q4_1", "Q4_0"), 2048, 512), (("Q4_K", "Q4_K", "Q5_1"), 2560, 640),
          (("Q4_0", "Q8_0", "Q4_1"), 1440, 480)]
+# The 17 types added after the first twelve, at the 35B's shapes, the 35B UD-Q4_K_XL's mix first.
+MIXES += [(t, 2048, 512) for t in (("Q4_K", "Q4_K", "Q6_K"), ("Q2_K", "IQ2_XXS", "Q3_K"), ("IQ3_S", "IQ1_M", "MXFP4"),
+                                   ("IQ2_XS", "IQ1_S", "BF16"), ("TQ1_0", "TQ2_0", "NVFP4"),
+                                   ("Q1_0", "F8_E4M3", "F16"), ("F32", "Q6_K", "Q6_K"))]
 TILES = ([1, 1, 3, 4], [4, 2, 16, 8])
 
 
