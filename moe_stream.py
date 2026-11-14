@@ -39,6 +39,9 @@ FRONT_TOKEN_BUDGET = 12_000
 PREFILL_PCT = 35
 MIN_PIECE = 2048
 
+# MLX 0.32's CUDA quantized matmul builds one kernel per tile height, for passes of 8-16, 17-32 and 33 or more rows (StreamingLLM.warm_tiles).
+TILE_ROWS = (16, 32, 64)
+
 # MLX's own buffer cache, small on purpose: the streamed experts must not be
 # held twice, and a freed pass buffer is worth less than the RAM it keeps.
 MLX_CACHE_GB = 0.05
@@ -320,6 +323,34 @@ class StreamingLLM:
             stream_fast.install_embed(self.model, st)
         if top_k:
             set_top_k(self.model, top_k)
+        total_gb = (stream_fast._sysctl_int("hw.memsize", width=8) or 0) / 1e9
+        # `draft="auto"`: a dense target takes the draft draft_find.py picks off the
+        # disk, loaded after the target because only install() says which one this is,
+        # and before the dense kernels are calibrated, which need to know whether a
+        # draft verifies several rows.
+        if auto and not streamed and not mtp:
+            import draft_find
+            budget = ((mem_peak_gb or total_gb * mem_pct / 100.0) - host_gb) * 1e9
+            a0, found = mx.get_active_memory(), None
+            try:
+                found = draft_find.find(path, budget=budget)
+                if found is not None:
+                    self._load_draft(path, found[0], draft_window)
+            except Exception as e:
+                # Directories on disk nobody named on the command line: if
+                # one of them breaks the scan or the load, the engine runs as
+                # it would have without a draft rather than not at all.
+                self._draft_model = self._draft_cache = None
+                print(f"  draft: auto -> {found[0] if found else 'scan'} "
+                      f"failed ({type(e).__name__}: {e}); none")
+            else:
+                if found is None:
+                    note("  draft: auto -> none found")
+                else:
+                    self._draft_auto = True
+                    note(f"  draft: auto -> {found[0]} (same tokenizer), "
+                          f"k={draft_tokens}, "
+                          f"{(mx.get_active_memory() - a0) / 1e9:.2f} GB resident")
         if not streamed and stream_fast.BACKEND != "metal":
             note(f"  target matmul: stock (rowqmm and foldattn are Metal kernels; "
                   f"{stream_fast.BACKEND} here)")
@@ -327,8 +358,11 @@ class StreamingLLM:
             # A dense target runs its multi-row passes through rowqmm's kernels where
             # install() timed them faster than stock, calibrated on the first load and
             # reused from disk.
+            # Rows 2..8 are only timed when a draft or an MTP head verifies several
+            # rows a pass; foldattn routes multi-row attention only.
             import rowqmm
-            layout = rowqmm.install(self.model)
+            multi = bool(mtp or self._draft_model)
+            layout = rowqmm.install(self.model, rows=rowqmm.ALL_ROWS if multi else (1,))
             routes = {}
             for key, cand in layout.items():
                 routes.setdefault(rowqmm._label(cand), set()).add(key[0])
@@ -339,12 +373,12 @@ class StreamingLLM:
             # Its multi-row attention likewise goes through foldattn's kernel
             # (each K/V read once per pass, not once per query row and head)
             # for the (context, T) buckets install() timed faster than stock.
-            import foldattn
-            foldattn.install(self.model)
+            if multi:
+                import foldattn
+                foldattn.install(self.model)
         # Prefill's own transient sized against the same process budget the arena
         # answers to, and on a streamed MoE also held to prefill_gb
         # (stream_fast.prefill_cap_bytes, PREFILL_PCT).
-        total_gb = (stream_fast._sysctl_int("hw.memsize", width=8) or 0) / 1e9
         rows = stream_fast.moe_row_elems(self.model)
         budget = mem_peak_gb or total_gb * mem_pct / 100.0
         if rows and not mem_peak_gb:
@@ -376,31 +410,6 @@ class StreamingLLM:
             note(f"  prefill attention: {attn[0]:.1f} B/row/key of scores at "
                  f"{sdpa_rows or 'no'} rows, {attn[1]:.1f} of indexer, "
                  f"{attn[2] / 1e3:.0f} KB/row, {attn[3] / 1e3:.1f} KB/key")
-        # `draft="auto"`: a dense target takes the draft draft_find.py picks off the
-        # disk, loaded after the target because only install() says which one this is.
-        if auto and not streamed and not mtp:
-            import draft_find
-            budget = ((mem_peak_gb or total_gb * mem_pct / 100.0) - host_gb) * 1e9
-            a0, found = mx.get_active_memory(), None
-            try:
-                found = draft_find.find(path, budget=budget)
-                if found is not None:
-                    self._load_draft(path, found[0], draft_window)
-            except Exception as e:
-                # Directories on disk nobody named on the command line: if
-                # one of them breaks the scan or the load, the engine runs as
-                # it would have without a draft rather than not at all.
-                self._draft_model = self._draft_cache = None
-                print(f"  draft: auto -> {found[0] if found else 'scan'} "
-                      f"failed ({type(e).__name__}: {e}); none")
-            else:
-                if found is None:
-                    note("  draft: auto -> none found")
-                else:
-                    self._draft_auto = True
-                    note(f"  draft: auto -> {found[0]} (same tokenizer), "
-                          f"k={draft_tokens}, "
-                          f"{(mx.get_active_memory() - a0) / 1e9:.2f} GB resident")
         # A saved expert profile seeded into the demand counters before the first decode
         # so the arena starts warm, kept so callers that persist state need not pass the
         # path twice.
@@ -1107,6 +1116,25 @@ class StreamingLLM:
         info.update(dropped=drop,
                     kept_mb=[round(self._conv_bytes(c) / 1e6, 1) for c in self._convs])
         return info
+
+    def warm_tiles(self, messages=None, widths=TILE_ROWS):
+        """Prefill a fresh cache of each width from `messages` rendered (else the last turn's ids), so the kernels a prompt that wide uses are built now and not in a user's request, keeping nothing."""
+        seen = (toolfmt.encode(self.tokenizer, self._raw_render(list(messages))) if messages
+                else list(self._seen))
+        if not seen:
+            return
+        held = self._cache, self._convs, self._pieces, self._parked, self._dropped
+        self._convs = ()
+        try:
+            for n in widths:
+                self._cache = make_prompt_cache(self.model)
+                self._prefill((seen * (n // len(seen) + 1))[:n], n)
+                if self._budget is not None:
+                    # Never folded into the budget's saved rate, which keeps a pass's largest growth a position and on the PC's 35B read 13.7 MB from the 16-id pass against 4.8 MB, shrinking the store.
+                    self._budget._pass = None
+        finally:
+            self._cache, self._convs, self._pieces, self._parked, self._dropped = held
+            mx.clear_cache()
 
     def _keep_room(self, marks):
         """What the budget's pool could still take with what is held now and `marks` more

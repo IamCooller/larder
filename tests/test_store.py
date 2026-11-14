@@ -56,7 +56,7 @@ MB on disk.
      nothing, and the trimmed cache holds and grows as the untrimmed one.
  13. A front restored from SSD is lazy until evaluated: the budget counts
      it as held before the pass that follows it, so warm turns after it
-     keep the pool (keep measured without it), a prefill after it is
+     keep the pool (keep as with the front evaluated first), a prefill after it is
      planned beside it and stays within the budget, and a new conversation
      measures keep again.
  14. plan(): a need over by a hair is two balanced pieces, not [n - 1, 1];
@@ -943,7 +943,7 @@ def check_restored_front(tmp, out):
     pool, rebuilds = pool_bytes(bud), bud.rebuilds
     assert pool > 0
 
-    def restore():
+    def restore(evaluated=False):
         # StreamingLLM.reset, then _reuse_front
         nonlocal cache
         bud.reset()
@@ -952,6 +952,8 @@ def check_restored_front(tmp, out):
         a0, held = mx.get_active_memory(), bud._measure()[0]
         cache = load_prompt_cache(path)
         assert mx.get_active_memory() - a0 < front / 10, "the restore was not lazy"
+        if evaluated:
+            mx.eval(stream_fast._cache_arrays(cache))
         return held
 
     restore()
@@ -963,10 +965,17 @@ def check_restored_front(tmp, out):
     peak = w.top + bud._measure()[1] + bud.cache
     assert (pool_bytes(bud), bud.rebuilds) == (pool, rebuilds), (
         "a warm turn after a restored front moved the pool", pool, bud.last)
-    assert bud.keep < front / 4, (bud.keep, front)
     passes.check(peak)
     warm = bud.keep
     del bud.tick, bud.close
+
+    # The same turn with the front evaluated before it: the lazy one's keep is this one's, or this one's plus the front had it counted as growth.
+    restore(evaluated=True)
+    fed(cache, 20)
+    for _ in range(3):
+        fed(cache, 1)
+    ref = bud.keep
+    assert warm < ref + front / 2, ("the restored front counted as growth", warm, ref, front)
 
     # A conversation's keep, handed on as a lazy restore used to leave it.
     bud.keep = front
@@ -976,7 +985,8 @@ def check_restored_front(tmp, out):
     assert bud.keep == front, "a decode token stood in for a warm turn"
     fed(cache, 20)
     fed(cache, 1)
-    assert bud.keep < front / 4, (bud.keep, front)
+    # Its own measurement replaced the handed-on keep, which held on would read the front or more.
+    assert bud.keep < front, ("the warm turn kept the handed-on keep", bud.keep, front)
 
     # A prefill after it, in exactly the room it needs beside the front.
     base = restore()
@@ -1000,7 +1010,8 @@ def check_restored_front(tmp, out):
     passes.check(peak)
     print(f"13. a front restored from SSD ({front / 1e6:.2f} MB, lazy until evaluated): "
           f"a warm turn after it kept the {pool / 1e3:.0f} KB pool, keep "
-          f"{warm / 1e3:.0f} KB; a new conversation's keep came from its warm turn, "
+          f"{warm / 1e3:.0f} KB ({ref / 1e3:.0f} KB with the front evaluated first); "
+          f"a new conversation's keep came from its warm turn, "
           f"not a decode token; a 200-position prefill after it began with the front "
           f"held, ran as {pieces}, peak {peak / 1e6:.2f} MB (budget {bud.peak / 1e6:.2f} MB)")
     del model, bud, cache

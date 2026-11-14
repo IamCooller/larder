@@ -18,6 +18,7 @@ tests/test_store.py
 tests/test_prefill_mem.py
 tests/test_layer_prefill.py
 tests/test_batching.py
+tests/test_calib_rows.py
 tests/test_reuse.py
 tests/test_forced_rows.py
 tests/test_vision.py
@@ -93,3 +94,5 @@ tests/test_golden_check.py
 tests/test_persist.py
 tests/test_device_room.py
 tests/test_graph_cache_env.py
+tests/test_warm_tiles.py
+tests/test_lm_pipe.py
