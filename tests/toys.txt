@@ -96,3 +96,4 @@ tests/test_device_room.py
 tests/test_graph_cache_env.py
 tests/test_warm_tiles.py
 tests/test_lm_pipe.py
+tests/test_qwen4_shim.py

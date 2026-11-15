@@ -200,7 +200,7 @@ The Neural Engine path calls private macOS interfaces (`AppleNeuralEngine.framew
 
 Larder runs on your computer. The server listens on 127.0.0.1 by default and refuses browser requests whose Origin or Host is not this computer, and the chat page loads nothing from the internet. The engine has no telemetry and no update check. These are all the network uses:
 
-- **Install.** `install.sh` clones this repository from GitHub and installs Python packages from PyPI, with mlx-lm from a pinned commit on GitHub.
+- **Install.** `install.sh` clones this repository from GitHub and installs Python packages from PyPI, with mlx-lm from a pinned commit on GitHub on a Mac and from PyPI on Linux.
 - **The menu.** Opening `./larder` reads Hugging Face metadata (revisions and file sizes) for the tested models that are not on disk yet. `/` in the menu and `--search` query Hugging Face's model search.
 - **Downloads.** A model you pick is downloaded from Hugging Face. A model already on disk starts without the network.
 - **`./larder share`** (experimental). It listens on your LAN and sends a UDP beacon so the menu on your other computers can find it. [SECURITY.md](SECURITY.md) describes the pairing and the encryption.
@@ -301,7 +301,7 @@ This project is built on other people's work:
 - [ddalcu/sushi](https://github.com/ddalcu/sushi), a fork of [beamivalice/sushi](https://github.com/beamivalice/sushi): the EXL3 expert kernels for Metal and CUDA, MIT licence.
 - [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3): the EXL3 file format and its trellis tiles, MIT licence.
 - [ml-explore/mlx](https://github.com/ml-explore/mlx): the array and GPU framework, and the operation order of several decode, attention and routing kernels, MIT licence.
-- [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm): model definitions, tokenizers and generation, MIT licence. It is installed from a pinned commit of a community fork (eauchs/mlx-lm), kept at [IamCooller/mlx-lm](https://github.com/IamCooller/mlx-lm) so the install does not depend on someone else's account.
+- [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm): model definitions, tokenizers and generation, MIT licence. On a Mac it is installed from a pinned commit of a community fork (eauchs/mlx-lm), kept at [IamCooller/mlx-lm](https://github.com/IamCooller/mlx-lm) so the install does not depend on someone else's account; on Linux it is PyPI's 0.32.0, and `qwen4_exp_vendor.py` carries that fork's Qwen3.8-Flash-Next model file.
 - [Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm): the Qwen3-VL vision tower that `vision.py` ports, MIT licence.
 - [beamster/Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw): the 3-bit EXL3 expert pack the launcher downloads for Flash-Next, Qwen Community License 1.0.
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml, gguf-py): the GGUF block formats and their dequantization, ported to Metal and CUDA kernels, MIT licence.

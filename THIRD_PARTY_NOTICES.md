@@ -11,6 +11,7 @@ and copyright, and where the full licence text sits.
 | turboderp-org/exllamav3 | Copyright (c) 2025 Turboderp | `exl3_experts.py`, `exl3_cuda.py` (the EXL3 format: 16x16 trellis tiles, the MCG codebook, the tensor-core permutation, the suh / svh Hadamards) |
 | ggml-org/llama.cpp (ggml, gguf-py), at commit b1c902f0 | Copyright (c) 2023-2026 The ggml authors | `gguf_ref.py` (the ggml block formats and their dequant: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_0, Q4_K, Q5_K, IQ2_S, IQ3_XXS, IQ4_NL, IQ4_XS, with the IQ grids and tables), `gguf_experts.py` (the same decode in Metal and CUDA kernels), `tools/gguf_repack.py` (the GGUF container layout). The CPU kernel that ships, `cpu_ext/cpu_kern.cpp`, holds no ggml code |
 | ml-explore/mlx | Copyright (c) 2023 Apple Inc. | `layer_glue.py` (rms norms, the column reduce, the sigmoid and silu values and the operation order of the decode-row kernels), `fused_router.py` (MLX's dtypes, operation order and argpartition tie order in the routing kernel), `route_cuda.py` (MLX's CUDA row reduce copied lane for lane, and the CUDA sort's tie order, in the CUDA routing kernel), `draftstep.py` (`qdot` from `kernels/quantized.h`, verbatim), `stream_fast.py` (the two-pass vector attention kernels of `sdpa_vector.h`, run over the picked keys), `qsa_tiles.py` (key tiles cut so that MLX's GEMM sums them in its own split-K order), `chunkattn.py` (MLX's softmax switch point and GEMM key alignment), `cpu_ext/cpu_kern.cpp` (MLX's affine-quantized matmul arithmetic on the CPU). `exl3_experts.py` patches the installed MLX's gather GEMM source at run time and ships none of it |
+| ml-explore/mlx-lm, `mlx_lm/models/qwen4_exp.py` of the fork kept at IamCooller/mlx-lm, commit 21968365 | Copyright © 2023 Apple Inc. | `qwen4_exp_vendor.py` (the Qwen3.8-Flash-Next model file, verbatim except absolute imports; used on Linux, where PyPI's mlx-lm has none) |
 | Blaizzy/mlx-vlm, `mlx_vlm/models/qwen3_vl/vision.py` | Copyright (c) 2025 Prince Canuma | `vision.py` (the Qwen3-VL vision tower, `_Tower` and the pieces under it; the licence is also inline in the file) |
 | markedjs/marked, 18.1.2 | Copyright (c) 2018+, MarkedJS (https://github.com/markedjs/); Copyright (c) 2011-2018, Christopher Jeffrey | `web/vendor/marked-18.1.2/marked.umd.js` (markdown to HTML in the chat page) |
 | cure53/DOMPurify, 3.4.17 | Copyright (c) Cure53 and other contributors | `web/vendor/dompurify-3.4.17/purify.min.js` (sanitises rendered markdown) |
@@ -104,6 +105,30 @@ SOFTWARE.
 MIT License
 
 Copyright (c) 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## ml-explore/mlx-lm
+
+MIT License
+
+Copyright © 2023 Apple Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
