@@ -30,6 +30,7 @@ from mlx_lm.models.cache import KVCache
 
 import kv_host as kh
 
+import engine_log  # noqa: F401  (serves qwen4_exp where the installed mlx-lm has none)
 try:
     from mlx_lm.models import qwen4_exp as q4
 except ImportError:

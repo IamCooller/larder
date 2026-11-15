@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import mlx.core as mx
 
+import engine_log  # noqa: F401  (serves qwen4_exp where the installed mlx-lm has none)
 try:
     from mlx_lm.models import qwen4_exp as q4
 except ImportError:

@@ -457,8 +457,9 @@ def check_auto(tmp):
     assert launch.recommend(table, models)[0]["id"] == "fast"             # then the best estimate
     assert launch.recommend([table[3]], models) is None
 
-    real_cache, real_pid_command = machine.CACHE, launch.pid_command
+    real_cache, real_pid_command, real_du = machine.CACHE, launch.pid_command, shutil.disk_usage
     machine.CACHE = tmp / "auto_cache"
+    shutil.disk_usage = lambda p: real_du(p)._replace(free=int(500e9))  # the picks must not hang on this disk's free space
     try:
         assert launch.last_entry(models) is None
         launch.remember(fast, "q3")
@@ -500,7 +501,7 @@ def check_auto(tmp):
         launch.clear_server()
         assert launch.stop_server() == 0                                  # nothing left to stop
     finally:
-        machine.CACHE, launch.pid_command = real_cache, real_pid_command
+        machine.CACHE, launch.pid_command, shutil.disk_usage = real_cache, real_pid_command, real_du
     print("11. one command: on disk first, then the best estimate, the last model remembered, "
           "status and stop on the saved server")
 

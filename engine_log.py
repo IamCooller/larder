@@ -9,7 +9,20 @@ if sys.platform.startswith("linux"):
     os.environ.setdefault("MLX_CUDA_GRAPH_CACHE_SIZE", GRAPH_CACHE)
     os.environ.setdefault("MLX_ENABLE_CACHE_THRASHING_CHECK", "0")
 
-verbose = True      # library users and tests see every note; chat.py and server.py turn them off without --verbose
+class _Qwen4Finder:
+    """Serves mlx_lm.models.qwen4_exp from the vendored copy when the installed mlx-lm has none (PyPI's)."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "mlx_lm.models.qwen4_exp":
+            return None
+        import importlib.util
+        here = os.path.dirname(os.path.abspath(__file__))
+        return importlib.util.spec_from_file_location(name, os.path.join(here, "qwen4_exp_vendor.py"))
+
+
+sys.meta_path.append(_Qwen4Finder())    # last in line: the fork's own qwen4_exp wins where it exists
+
+verbose = True     # library users and tests see every note; chat.py and server.py turn them off without --verbose
 
 
 def set_verbose(on):
