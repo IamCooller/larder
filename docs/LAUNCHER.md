@@ -214,7 +214,8 @@ for an idle computer and two lines saying that, while a real start stops with th
 
 In auto mode (`./larder --auto`, or no terminal) the same point prints four lines instead (the chat URL, the API base, the
 stop command, the model and its estimate), the browser opens, and there is no terminal chat:
-the process stays in the foreground serving until `./larder stop` or Ctrl+C.
+the process stays in the foreground serving until `./larder stop` or Ctrl+C. With the terminal chat the launcher
+returns to the shell when the chat ends and the server keeps running until `./larder stop`.
 
 ## What runs
 

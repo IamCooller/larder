@@ -2370,6 +2370,8 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
                     if span > w:
                         # chunkattn's bracket resets the peak and keeps what it saw in _top; the run's buffers go back to the device, not to the decode after it.
                         bud.lmr_pos = max(bud.lmr_pos, (max(bud._top, mx.get_peak_memory()) - a0 - held) / span)
+                        # The run is measured here and not as a pass, so its tick's footprint mark ends with it: left set, the next close read the run's device growth (0.2-0.45 GB at 8k) as a decode pass's growth, into the keep every decode pass's need adds.
+                        bud._foot0 = 0
                         if _LMR_PIPE:
                             _lmr_end(bud, span)
                             ran = True
@@ -4876,6 +4878,40 @@ class StreamingSwitchGLU(nn.Module):
         y = gguf_experts.dense(x.reshape(-1, hid), tuple(b[0] for b in bufs), host, types, x.dtype)
         return y.reshape(len(host), 1, hid)
 
+    def _dense_into(self, ys, x64, src, dst, bufs, host, dtype, room):
+        """_dense_only's chunks, kernels and casts with the rows moved by index: each chunk's f16 input rows `src` taken
+        from the run's input viewed as uint64, and its output appended to `ys` with its rows `dst` of the run's output,
+        a chunk's buffers within `room` bytes (gguf_experts.dense is copied here so its file, the cost model's key,
+        stays as it is)."""
+        (bg, bu, bd), types = tuple(b[0] for b in bufs), tuple(self._gguf.split("/")) if isinstance(self._gguf, str) else tuple(self._gguf)
+        hid = x64.shape[-1] * 4
+        order = np.argsort(host, kind="stable")
+        hs = host[order]
+        uniq, first = np.unique(hs, return_index=True)
+        bounds = list(first) + [len(hs)]
+        # Experts a chunk: the room over an expert's three f16 matrices and its share of the rows' transient buffers, never
+        # under DENSE_CHUNK (40a972bf's chunk_for).
+        n, inter = len(hs), gguf_experts.dims(bg, types[0])[0]
+        per = 6 * inter * hid + (4 * hid + 26 * inter) * -(-n // len(uniq))
+        c = max(gguf_experts.DENSE_CHUNK, int(room // per))
+        # Every chunk's rows, places and slots in one host array sliced on the device, since a host-made array lives in managed memory and faults on the GPU's first read (~0.25 ms a chunk on the PC).
+        idx = mx.array(np.concatenate([src[order], dst[order], np.searchsorted(uniq, hs) % c, uniq]).astype(np.uint32))
+        for a in range(0, len(uniq), c):
+            b = min(a + c, len(uniq))
+            r0, r1 = int(bounds[a]), int(bounds[b])
+            slots, loc = idx[3 * n + a:3 * n + b], idx[2 * n + r0:2 * n + r1]
+            xin = x64[idx[r0:r1]].view(mx.float16).reshape(r1 - r0, 1, hid)
+            g = gguf_experts._mm(xin, gguf_experts.dequant(bg, slots, types[0], mx.float16), loc)
+            u = gguf_experts._mm(xin, gguf_experts.dequant(bu, slots, types[1], mx.float16), loc)
+            hh = (g * mx.sigmoid(g) * u).astype(mx.float16).reshape(r1 - r0, 1, -1)
+            # f16 straight to the output dtype: bit-equal to the f32 step between for all 65,536 f16 values (measured on CUDA).
+            y = mx.gather_mm(hh, gguf_experts.dequant(bd, slots, types[2], mx.float16).swapaxes(1, 2), rhs_indices=loc,
+                             sorted_indices=True)[:, 0].astype(dtype)
+            ys.append((idx[n + r0:n + r1], y))
+            if b < len(uniq):
+                mx.eval(y)          # one chunk's Q at a time
+        return y
+
     def _take_group(self, ids, store, copy=True, ring=None):
         """MOE_RESIDENT, _call_grouped's group without the release: the rows _batch_wide would read (the span lo..hi when
         dense, else the ids) gathered from the store, the ids it does not hold first copied into ring rows (_fetch, or
@@ -4947,7 +4983,8 @@ class StreamingSwitchGLU(nn.Module):
                       for gi, (r0, r1) in enumerate(zip(bounds, bounds[1:]))]
         else:
             # MOE_RESIDENT_LM: each piece's rows grouped as the piece's own pass groups them, so a row takes the path (dense or chain) it takes there.
-            piece = np.searchsorted([a for a, _ in lmr], np.array(rows) // k, "right") - 1
+            flat = np.asarray(rows)
+            piece = np.searchsorted([a for a, _ in lmr], flat // k, "right") - 1
             groups = (_lmr_groups if _LMR_PIPE else _lmr_groups_ref)(np.asarray(pos), piece, len(lmr), half)
         # A unit: its rows (indices into pos), its misses (indices into unique_ids, ascending), and a taken group's experts or None on the chain.
         units, hit, cmiss, chain = [], [], [], []
@@ -4961,16 +4998,23 @@ class StreamingSwitchGLU(nn.Module):
                 chain.append(r)
             else:
                 units.append((r, m, None))
-        if _LM_DENSE_RUN and lmr is not None and any(u[2] is not None for u in units):
+        run_dense = _LM_DENSE_RUN and lmr is not None
+        # The run's dense rows read the input by position and land in the output by row, no gather of every row first and no scatter a unit (same bytes moved).
+        fused = run_dense and _DENSE_INPLACE and out is None and x.dtype.size == 2 and x.shape[-1] % 4 == 0
+        if run_dense and any(u[2] is not None for u in units):
             # MOE_LM_DENSE_RUN: the rows each piece sent dense, regrouped by expert over the whole run (half its experts a unit, so the misses fit a ring half); a row's path is its piece's and its bits do not depend on its call's other rows (measured on CUDA and Metal).
             dr = np.sort(np.concatenate([u[0] for u in units if u[2] is not None]))
-            ue = np.unique(pos[dr])
-            merged = []
-            for i in range(0, len(ue), half):
-                g = ue[i:i + half]
-                r = dr[(pos[dr] >= g[0]) & (pos[dr] <= g[-1])]
-                merged.append((r, g[~inq[g]], g))
-            units = merged + [u for u in units if u[2] is None]
+            pd = pos[dr]
+            ue = np.unique(pd)
+            if fused:
+                # A unit ends where its misses would overflow a ring half, as resident experts cost the ring nothing (40a972bf).
+                mf = ~inq[ue]
+                spans = np.split(ue, np.flatnonzero(np.diff((np.cumsum(mf) - mf) // half)) + 1)
+            else:
+                spans = [ue[i:i + half] for i in range(0, len(ue), half)]
+            # pos is ascending, so a span's rows are one run of dr.
+            units = [(dr[np.searchsorted(pd, g[0]):np.searchsorted(pd, g[-1], "right")], g[~inq[g]], g) for g in spans] \
+                + [u for u in units if u[2] is None]
         if cmiss:
             # Pieces share experts, so a miss is copied once for every piece's chain rows.
             hit, cmiss = np.sort(np.concatenate(hit)), np.unique(np.concatenate(cmiss))
@@ -4996,7 +5040,9 @@ class StreamingSwitchGLU(nn.Module):
         # Every unit's rows and chain slots in one host array a layer, sliced on the device: an array the host makes a unit cost ~0.2 ms of GPU each.
         dev = mx.array(np.concatenate([u[0] for u in units] + slots).astype(np.uint32))
         dst_all = rows[dev[:cut[-1]]]
-        src_all = x[dst_all // k]
+        if fused:
+            x64 = x.astype(mx.float16).reshape(x.shape[0], -1).view(mx.uint64)
+        src_all = None if fused else x[dst_all // k]
         c0 = cut[-1]
         own = [tuple(b) for b in store.bufs]
         busy = [None, None]     # OVERLAP: per ring half, the output of the last launched unit that reads it
@@ -5013,9 +5059,10 @@ class StreamingSwitchGLU(nn.Module):
             return self._fetch(unique_ids[m], store, base[i])
 
         ring, reads = fetch(0) if units else None, None
-        run_dense = _LM_DENSE_RUN and lmr is not None
         for i, (r, m, a) in enumerate(units):
-            dst, src0 = dst_all[cut[i]:cut[i + 1]], src_all[cut[i]:cut[i + 1]]
+            dst = dst_all[cut[i]:cut[i + 1]]
+            src0 = None if fused else src_all[cut[i]:cut[i + 1]]
+            put = True
             if a is not None:
                 ids = unique_ids[a]
                 pg = np.searchsorted(a, pos[r])
@@ -5023,7 +5070,12 @@ class StreamingSwitchGLU(nn.Module):
                     # The dense path reads each row's expert at its store slot (a ring row for a miss), as the chain does, with no take of the group's rows.
                     _, lo, sl = self._take_group(ids, store, copy=False, ring=ring)
                     h = sl[ids[pg] - lo if lo is not None else pg].astype(np.uint32)
-                    y = self._dense_only(src0, own, h) if run_dense else self._experts(src0, own, mx.array(h), False, h)[2]
+                    if fused:
+                        # y is the unit's last chunk, done only once every ring row the unit reads is read.
+                        # A chunk's room: the bytes of the gather of every row's input this path no longer makes, so the run's peak stays under main's (a room from the device's free memory ran out of it at 64 experts a chunk).
+                        y, put = self._dense_into(ys, x64, flat[r] // k, flat[r], own, h, x.dtype, n_rows * x.shape[-1] * x.dtype.size), False
+                    else:
+                        y = self._dense_only(src0, own, h) if run_dense else self._experts(src0, own, mx.array(h), False, h)[2]
                     reads = base[i] // half if len(m) else None
                 else:
                     bufs, lo, _ = self._take_group(ids, store, ring=ring)
@@ -5031,13 +5083,13 @@ class StreamingSwitchGLU(nn.Module):
                     y = self._dense_only(src0, bufs, h) if run_dense else self._experts(src0, bufs, mx.array(h), False, h)[2]
                     reads = None
             else:
-                y = self._experts(src0, own, dev[c0:c0 + len(r)])[2]
+                y = self._experts(x[dst // k] if fused else src0, own, dev[c0:c0 + len(r)])[2]
                 c0 += len(r)
                 reads = base[i] // half if len(m) else None
             if lmr is None:
                 out = _wide_out(out, n_rows, y)
                 out[dst] = y
-            else:
+            elif put:
                 ys.append((dst, y))
             if _OVERLAP:
                 mx.async_eval(out if lmr is None else y)
@@ -5048,7 +5100,13 @@ class StreamingSwitchGLU(nn.Module):
             elif i + 1 < len(units):
                 mx.eval(out if lmr is None else y)
                 ring = fetch(i + 1)
-        if ys:
+        if fused:
+            # One chain of scatters evaluated at once, each updating the output in place, viewed as uint32 (the same bytes in half the elements); an output evaluated between them would be copied whole each time.
+            o32 = mx.zeros((n_rows, x.shape[-1] // 2), dtype=mx.uint32)
+            for d, v in ys:
+                o32[d] = v.reshape(v.shape[0], -1).view(mx.uint32)
+            out = o32.view(x.dtype).reshape(n_rows, 1, -1)
+        elif ys:
             # MOE_RESIDENT_LM: one scatter of every unit's rows, since a copy of a run's whole output a unit held ~20 of them at once.
             out = _wide_out(out, n_rows, ys[0][1])
             if _UNIT_SCATTER:

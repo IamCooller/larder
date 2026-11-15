@@ -12,7 +12,8 @@ and one layer's sorted rows, through StreamingSwitchGLU._call_grouped.
      program took the freed VRAM) still leaves the big store given back;
   5. MOE_RESIDENT_LM: one call over several pieces' rows (the pieces' bounds in `_lmr`) gives every row the bits its
      own piece's call gives, the heavy group dense in the wide pieces and on the chain in the narrow one, with fewer
-     copies than the pieces make apart.
+     copies than the pieces make apart; with the wide cut's four flags off and on (the dense rows then moved by index,
+     _dense_into, in units until their misses fill a ring half), at dense chunks of 8 and 3 experts.
 
     perl -e 'alarm shift; exec @ARGV' 280 python3 tests/test_resident_units.py
 """
@@ -68,6 +69,7 @@ class Glu:
     _fetch = sf.StreamingSwitchGLU._fetch
     _experts = sf.StreamingSwitchGLU._experts
     _dense_only = sf.StreamingSwitchGLU._dense_only
+    _dense_into = sf.StreamingSwitchGLU._dense_into
     _own_kernels = sf.StreamingSwitchGLU._own_kernels
 
 
@@ -151,8 +153,8 @@ def check_lmr(g, store, views, rng, log):
     bad = int((y.view(np.uint32) != ref.view(np.uint32)).sum())
     assert bad == 0, f"layer-major: {bad} of {y.size} values differ from the pieces' own calls"
     assert len(log) < n_apart, (len(log), n_apart)
-    print(f"  layer-major: pieces {sizes} in one call bit-equal to each piece's own, {len(log)} copies against "
-          f"{n_apart} apart")
+    print(f"  layer-major (flags {'on' if sf._LM_DENSE_RUN else 'off'}, chunk {ge.DENSE_CHUNK}): pieces {sizes} in one "
+          f"call bit-equal to each piece's own, {len(log)} copies against {n_apart} apart")
 
 
 def check_fit_order():
@@ -266,7 +268,19 @@ def main():
             print(f"  {n_pos} positions: {len(flat)} rows (the heavy group's {int((flat < 8).sum())} on the {'dense path' if heavy else 'chain'}), main {n_main} copies, "
                   f"overlap {len(got['overlap'])}, onecall {len(got['onecall'])} (sizes "
                   f"{[n for n, _ in got['onecall']]}), both {len(got['both'])}: bit-equal to main")
-        check_lmr(g, store, views, rng, log)
+        flags = ("_LMR_PIPE", "_DENSE_INPLACE", "_UNIT_SCATTER", "_LM_DENSE_RUN")
+        was = [getattr(sf, f) for f in flags] + [ge.DENSE_CHUNK]
+        try:
+            for on in (False, True):
+                for f in flags:
+                    setattr(sf, f, on)
+                for chunk in (8, 3):
+                    ge.DENSE_CHUNK = chunk
+                    check_lmr(g, store, views, rng, log)
+        finally:
+            for f, v in zip(flags, was):
+                setattr(sf, f, v)
+            ge.DENSE_CHUNK = was[-1]
         sf._NATIVE, sf._CUDA_STAGE = None, None
     print("test_resident_units: ok")
 
