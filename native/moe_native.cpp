@@ -336,13 +336,14 @@ static void on_exit_signal(int sig, siginfo_t* info, void* ctx) {
   ssize_t ignored = wait_pending() ? write(2, a, sizeof(a) - 1) : write(2, b, sizeof(b) - 1);
   (void)ignored;
   auto& p = g_prev[sig];
-  if (p.sa_flags & SA_SIGINFO) {
-    p.sa_sigaction(sig, info, ctx);
-  } else if (p.sa_handler != SIG_DFL && p.sa_handler != SIG_IGN) {
-    p.sa_handler(sig);
-  } else {
+  // The handler's value decides and not SA_SIGINFO, which macOS 26 leaves set on a signal exec reset to SIG_DFL.
+  if (p.sa_handler == SIG_DFL || p.sa_handler == SIG_IGN) {
     signal(sig, SIG_DFL);
     raise(sig);
+  } else if (p.sa_flags & SA_SIGINFO) {
+    p.sa_sigaction(sig, info, ctx);
+  } else {
+    p.sa_handler(sig);
   }
 }
 
@@ -350,7 +351,7 @@ static void hook_exit_signals() {
   for (int sig : {SIGTERM, SIGHUP}) {
     struct sigaction prev = {}, sa = {};
     sigaction(sig, nullptr, &prev);
-    if (!(prev.sa_flags & SA_SIGINFO) && prev.sa_handler == SIG_IGN)
+    if (prev.sa_handler == SIG_IGN)
       continue;
     g_prev[sig] = prev;
     sa.sa_sigaction = on_exit_signal;

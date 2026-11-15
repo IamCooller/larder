@@ -555,6 +555,10 @@ def settings(p, m):
         if experts_gb <= g - dense + ram:
             env["MOE_RESIDENT"] = "1"
             why.append(f"all {experts_gb:.1f} GB of experts resident across VRAM and a pinned RAM tier ({ram:.1f} GB of RAM free)")
+            if m.get("format") == "gguf":
+                # The wide prompt cut of a GGUF pack's layer-major runs, which passed a paired 564-item quality gate.
+                env.update(MOE_LM_PIPE="1", MOE_DENSE_INPLACE="1", MOE_UNIT_SCATTER="1", MOE_LM_DENSE_RUN="1",
+                           MOE_PIECE="1024")
     elif m.get("recipe") == "arena":
         # The adaptive arena sizes itself from free memory while it runs, by the governor's own rule.
         args += ["--prefill-step", "0", "--keep-convs", "4"]

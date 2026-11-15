@@ -67,6 +67,7 @@ class Glu:
     _take_group = sf.StreamingSwitchGLU._take_group
     _fetch = sf.StreamingSwitchGLU._fetch
     _experts = sf.StreamingSwitchGLU._experts
+    _dense_only = sf.StreamingSwitchGLU._dense_only
     _own_kernels = sf.StreamingSwitchGLU._own_kernels
 
 

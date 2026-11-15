@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="604.8pt" height="619.2pt" viewBox="0 0 604.8 619.2" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="604.8pt" height="627.3pt" viewBox="0 0 604.8 627.3" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-11-11T23:34:35.485759</dc:date>
+    <dc:date>2026-11-14T12:00:00.000000</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -246,97 +246,97 @@ z
    </g>
    <g id="patch_11">
     <path d="M 334.024482 305.750794 
-L 362.411649 305.750794 
-L 362.411649 287.248728 
+L 362.780133 305.750794 
+L 362.780133 287.248728 
 L 334.024482 287.248728 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6"/>
    </g>
    <g id="patch_12">
-    <path d="M 362.411649 305.750794 
-L 362.824981 305.750794 
-L 362.824981 287.248728 
-L 362.411649 287.248728 
+    <path d="M 362.780133 305.750794 
+L 368.637187 305.750794 
+L 368.637187 287.248728 
+L 362.780133 287.248728 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6; opacity: 0.45"/>
    </g>
    <g id="patch_13">
     <path d="M 334.024482 338.790197 
-L 336.288734 338.790197 
-L 336.288734 320.288131 
+L 343.146700 338.790197 
+L 343.146700 320.288131 
 L 334.024482 320.288131 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6"/>
    </g>
    <g id="patch_14">
-    <path d="M 336.288734 338.790197 
-L 340.416585 338.790197 
-L 340.416585 320.288131 
-L 336.288734 320.288131 
+    <path d="M 343.146700 338.790197 
+L 348.252220 338.790197 
+L 348.252220 320.288131 
+L 343.146700 320.288131 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6; opacity: 0.45"/>
    </g>
    <g id="patch_15">
     <path d="M 334.024482 371.8296 
-L 290.565682 371.8296 
-L 290.565682 353.327534 
+L 314.516443 371.8296 
+L 314.516443 353.327534 
 L 334.024482 353.327534 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834"/>
    </g>
    <g id="patch_16">
-    <path d="M 290.565682 371.8296 
-L 290.484154 371.8296 
-L 290.484154 353.327534 
-L 290.565682 353.327534 
+    <path d="M 314.516443 371.8296 
+L 309.505224 371.8296 
+L 309.505224 353.327534 
+L 314.516443 353.327534 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834; opacity: 0.45"/>
    </g>
    <g id="patch_17">
     <path d="M 334.024482 421.388704 
-L 343.805618 421.388704 
-L 343.805618 402.886639 
+L 343.804318 421.388704 
+L 343.804318 402.886639 
 L 334.024482 402.886639 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6"/>
    </g>
    <g id="patch_18">
-    <path d="M 343.805618 421.388704 
-L 344.885042 421.388704 
-L 344.885042 402.886639 
-L 343.805618 402.886639 
+    <path d="M 343.804318 421.388704 
+L 347.632805 421.388704 
+L 347.632805 402.886639 
+L 343.804318 402.886639 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #2a78d6; opacity: 0.45"/>
    </g>
    <g id="patch_19">
     <path d="M 334.024482 454.428107 
-L 329.600127 454.428107 
-L 329.600127 435.926042 
+L 330.977564 454.428107 
+L 330.977564 435.926042 
 L 334.024482 435.926042 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834"/>
    </g>
    <g id="patch_20">
-    <path d="M 329.600127 454.428107 
-L 329.442017 454.428107 
-L 329.442017 435.926042 
-L 329.600127 435.926042 
+    <path d="M 330.977564 454.428107 
+L 323.630082 454.428107 
+L 323.630082 435.926042 
+L 330.977564 435.926042 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834; opacity: 0.45"/>
    </g>
    <g id="patch_21">
     <path d="M 334.024482 487.46751 
-L 285.159582 487.46751 
-L 285.159582 468.965445 
+L 298.344305 487.46751 
+L 298.344305 468.965445 
 L 334.024482 468.965445 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834"/>
    </g>
    <g id="patch_22">
-    <path d="M 285.159582 487.46751 
-L 284.278354 487.46751 
-L 284.278354 468.965445 
-L 285.159582 468.965445 
+    <path d="M 298.344305 487.46751 
+L 294.642432 487.46751 
+L 294.642432 468.965445 
+L 298.344305 468.965445 
 z
 " clip-path="url(#pb048a3f7c0)" style="fill: #eb6834; opacity: 0.45"/>
    </g>
@@ -363,22 +363,22 @@ L 592.704 504.648
     <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="383.609761" y="226.484832" transform="rotate(-0 383.609761 226.484832)">1.3× to 1.8×</text>
    </g>
    <g id="text_21">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="369.033289" y="299.171519" transform="rotate(-0 369.033289 299.171519)">1.5×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="374.837187" y="299.171519" transform="rotate(-0 374.837187 299.171519)">1.47× to 1.59×</text>
    </g>
    <g id="text_22">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="346.624893" y="332.210922" transform="rotate(-0 346.624893 332.210922)">1.03× to 1.09×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="354.452220" y="332.210922" transform="rotate(-0 354.452220 332.210922)">1.13× to 1.21×</text>
    </g>
    <g id="text_23">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="284.275846" y="365.250325" transform="rotate(-0 284.275846 365.250325)">0.56×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="303.305224" y="365.250325" transform="rotate(-0 303.305224 365.250325)">0.72× to 0.77×</text>
    </g>
    <g id="text_24">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="351.09335" y="414.809429" transform="rotate(-0 351.09335 414.809429)">1.14× to 1.16×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: start; fill: #0b0b0b" x="353.832805" y="414.809429" transform="rotate(-0 353.832805 414.809429)">1.14× to 1.20×</text>
    </g>
    <g id="text_25">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="323.233709" y="447.848832" transform="rotate(-0 323.233709 447.848832)">0.94×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="317.430082" y="447.848832" transform="rotate(-0 317.430082 447.848832)">0.87× to 0.96×</text>
    </g>
    <g id="text_26">
-    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="278.070046" y="480.888235" transform="rotate(-0 278.070046 480.888235)">0.51× to 0.52×</text>
+    <text style="font-size: 10.5px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #0b0b0b" x="288.442432" y="480.888235" transform="rotate(-0 288.442432 480.888235)">0.59× to 0.62×</text>
    </g>
    <g id="text_27">
     <text style="font-weight: 700; font-size: 10px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; text-anchor: end; fill: #eb6834" x="326.264096" y="76.079104" transform="rotate(-0 326.264096 76.079104)">llama.cpp faster</text>
@@ -405,10 +405,11 @@ L 592.704 504.648
    <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 565.490575)">request from an external USB4 SSD; llama.cpp ran a 4.25-bit IQ4_XS from that external SSD alone; 1k, 4k and 16k prompts.</text>
    <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 573.576462)">PC, RTX 5060 Ti 16 GB, 15 GB RAM. Qwen3.8-Flash-Next, 2026-11-06: Larder's 4-bit research pack (60.9 GB of experts) against unsloth's UD-Q4_K_XL</text>
    <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 581.757162)">(77 GB), exact routing on both sides; stock llama.cpp swapped past the memory guard while loading, so its row is llama.cpp with</text>
-   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 589.937862)">Larder's expert store patched in; short and 8k prompts, the first token at 8k one run. 35B, 2026-11-11, one session, both orders: llama.cpp's Q4_0 GGUF at</text>
-   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 597.954375)">--n-cpu-moe 11 (its fastest decode that fits) against Larder on the same experts. Reading the 8k prompt is against llama.cpp's fastest prompt setting,</text>
-   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 606.0657)">-ub 4096 -b 4096 --n-cpu-moe 20 (1,640 tokens/s, one run, a later session), which decodes slower: the two fastest settings differ. The recipe is what ./larder</text>
-   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 614.2464)">installs: cache bias 0.5, which passed its paired quality gate, and the model's MTP head. Exact routing: cache bias 0, no head. Short decode: turns 2-3; 8k: 8,074 / 8,086 tokens.</text>
+      <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 589.937862)">Larder's expert store patched in; short and 8k prompts, the first token at 8k one run. 35B, 2026-11-14, one session, both orders: llama.cpp's Q4_0</text>
+   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 598.037862)">GGUF at --n-cpu-moe 10 at short turns, 11 at 8k (its fastest decode that fits) against Larder on the same experts. Reading the 8k prompt is against</text>
+   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 606.137862)">llama.cpp's fastest prompt setting, -ub 4096 -b 4096 --n-cpu-moe 20 (1,566 to 1,612 tokens/s in three of four runs; ~79 tokens/s decode): the two</text>
+   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 614.237862)">fastest settings differ. The recipe is what ./larder installs: cache bias 0.5 (paired quality gate passed), the model's MTP head and the wide prompt</text>
+   <text style="font-size: 7.4px; font-family: 'Helvetica', 'Arial', 'DejaVu Sans', sans-serif; fill: #52514e" transform="translate(12.096 622.337862)">cut (gate passed). Exact routing: bias 0, no head. Short decode: turns 2-3; 8k: 8,074 / 8,086 tokens.</text>
   </g>
  </g>
  <defs>

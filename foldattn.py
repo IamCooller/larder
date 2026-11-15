@@ -384,14 +384,16 @@ def install(model, table=None, verbose=False):
                      for k, c in json.loads(path.read_text()).items()}
             note(f"  foldattn: calibrated routes reused from {path}")
         except (OSError, ValueError):
+            print("  measuring this Mac's attention kernels for this model, once (under a minute)",
+                  flush=True)
             t0 = time.perf_counter()
             table = calibrate(shapes, layers, dtype, verbose=verbose)
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps({",".join(map(str, k)): c for k, c in table.items()}))
             tmp.replace(path)
-            note(f"  foldattn: calibrated in {time.perf_counter() - t0:.0f} s, "
-                  f"saved to {path}")
+            print(f"  kernels measured in {time.perf_counter() - t0:.0f} s, saved to {path}",
+                  flush=True)
     for mod in mods:
         if not hasattr(mod.scaled_dot_product_attention, "foldattn"):
             mod.scaled_dot_product_attention = _wrap(mod.scaled_dot_product_attention)

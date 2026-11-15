@@ -267,6 +267,7 @@ def _set_layout(layout):
 # model's projection shapes): calibration times the model's own forward and
 # takes ~100 s on a 4B, too long to pay on every load.
 LAYOUT_DIR = Path.home() / ".cache" / "moe-ssd-offload"
+ALL_ROWS = range(1, 9)
 
 
 def _layout_path(model):
@@ -279,43 +280,59 @@ def _layout_path(model):
 
 
 def _load_layout(path):
-    """The saved layout, or None if there is none or a label no longer names
-    a candidate."""
+    """(layout, rows already calibrated) from the saved file, or None if there
+    is none or a label no longer names a candidate. A file without a "rows"
+    entry was written when every row count was calibrated."""
     try:
         saved = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+    rows = {int(r) for r in saved.pop("rows", "").split(",") if r} or set(ALL_ROWS)
     by_label = {_label(c): c for c in CANDIDATES}
     if not all(lbl in by_label for lbl in saved.values()):
         return None
-    return {tuple(int(x) for x in k.split(",")): by_label[lbl]
-            for k, lbl in saved.items()}
+    return ({tuple(int(x) for x in k.split(",")): by_label[lbl]
+             for k, lbl in saved.items()}, rows)
 
 
-def _save_layout(path, layout):
+def _save_layout(path, layout, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({",".join(map(str, k)): _label(c)
-                               for k, c in layout.items()}))
+    out = {",".join(map(str, k)): _label(c) for k, c in layout.items()}
+    out["rows"] = ",".join(map(str, sorted(rows)))
+    tmp.write_text(json.dumps(out))
     tmp.replace(path)
 
 
-def install(model, layout=None, verbose=False):
+def _calibration_eta(model, rows):
+    """Seconds calibrating `rows` will take: its forward count times one forward."""
+    n_fwd = len(rows) * (1 + len(shapes_of(model)) * len(CANDIDATES)) * 13
+    ids = _new_ids(rows[0], _vocab_size(model))
+    mx.eval(model(ids))
+    t0 = time.perf_counter()
+    mx.eval(model(ids))
+    return n_fwd * (time.perf_counter() - t0)
+
+
+def install(model, layout=None, verbose=False, rows=(1,)):
     """Route every quantized projection through the kernel for the row counts
     calibration picked. Returns the {rows: row_block} map that was installed.
     Without `layout`, reuses this machine's saved calibration for the model's
-    shapes, or calibrates and saves one; prints which."""
+    shapes and times only the `rows` it lacks, merging them in; prints which."""
     if layout is None:
         path = _layout_path(model)
-        layout = _load_layout(path)
-        if layout is not None:
+        layout, done = _load_layout(path) or ({}, set())
+        need = sorted(set(rows) - done)
+        if not need:
             note(f"  rowqmm: calibrated layout reused from {path}")
         else:
+            print(f"  measuring this Mac's kernels for this model, once "
+                  f"(about {_calibration_eta(model, need):.0f} s, T={need})", flush=True)
             t0 = time.perf_counter()
-            layout = calibrate(model, verbose=verbose)
-            _save_layout(path, layout)
-            note(f"  rowqmm: calibrated in {time.perf_counter() - t0:.0f} s, "
-                  f"saved to {path}")
+            layout.update(calibrate(model, rows=need, verbose=verbose))
+            _save_layout(path, layout, done | set(need))
+            print(f"  kernels measured in {time.perf_counter() - t0:.0f} s, saved to {path}",
+                  flush=True)
     for m, wrap in _targets(model):
         m.__class__ = wrap
     _set_layout(layout)

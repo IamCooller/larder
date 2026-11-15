@@ -15,7 +15,9 @@ cannot hang the GPU while the child lives:
          the child itself the moment moe_native.pending() shows a wait not
          yet passed. moe_native's handler says whether one was pending, i.e.
          where the old engine hung the GPU; at least one TERM must land so.
-         The process dies of the signal at once.
+         The process dies of the signal at once, also when the action
+         before moe_native's is SIG_DFL with SA_SIGINFO set, as exec leaves
+         it on macOS 26 under a parent that had the handler (rc -11 before).
 
 After each case the GPU (ioreg "Device Utilization %") is idle within 4 s of
 the exit -- a wait left spinning would hold it for the 10 s bound -- and the
@@ -159,7 +161,18 @@ def kill_when_pending(nv):
     os.kill(os.getpid(), signal.SIGTERM)
 
 
+def stale_siginfo():
+    """SIGTERM at SIG_DFL with SA_SIGINFO set, as exec leaves it on macOS 26, so every macOS checks the chain to it."""
+    import ctypes
+
+    class Sigaction(ctypes.Structure):
+        _fields_ = [("handler", ctypes.c_void_p), ("mask", ctypes.c_uint32), ("flags", ctypes.c_int)]
+    sa = Sigaction(None, 0, 0x40 | 0x2)     # SA_SIGINFO | SA_RESTART
+    assert ctypes.CDLL(None).sigaction(signal.SIGTERM, ctypes.byref(sa), None) == 0
+
+
 def case_term(self_kill=False):
+    stale_siginfo()
     nv = native()
     import mlx.core as mx
     from mlx_lm.generate import generate_step

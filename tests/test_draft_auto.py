@@ -268,7 +268,7 @@ def stubbed_engine(streamed, found, load_fails=False):
     moe_stream.load_slim_aware = lambda p, s: (support.toy_model(seed=0), tok, None)
     moe_stream.install = lambda *a, **k: (3 if streamed else 0, None)
     moe_stream.stream_fast.install_embed = lambda m, st: None
-    rowqmm.install = lambda m: {}
+    rowqmm.install = lambda m, **k: {}
     foldattn.install = lambda m: None
     chunkattn.install = lambda m: None
     def find(p, budget=None):

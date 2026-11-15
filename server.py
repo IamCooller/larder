@@ -46,7 +46,7 @@ import machine                      # the live conditions the speed depends on
 import share                        # the local-only rule this server and the share proxy apply
 import stream_fast
 from memory_core import clone_cache_keeping_gap
-from moe_stream import StreamingLLM
+from moe_stream import TILE_ROWS, StreamingLLM
 from mtp import DEFAULT_MTP
 from sampler import Sampling
 import web_settings                     # the Settings page's endpoints and option keys
@@ -494,6 +494,20 @@ class ModelHost:
             finally:
                 gone.set()
         return consume()
+
+    def warm_tiles(self, messages):
+        """CUDA, before the launcher's warm-up reply: prompt passes of every width MLX builds its own quantized-matmul kernel for (StreamingLLM.warm_tiles), so none is built in a user's request; a failure is said and never fails the warm-up."""
+        if stream_fast.BACKEND != "cuda" or self.llm is None:
+            return
+        t0 = time.time()
+        try:
+            self.executor.submit(lambda: self.llm.warm_tiles(messages)).result()
+        except Exception as e:
+            print(f"  warm-up: prompt-width kernels not built ({type(e).__name__}: {e})", flush=True)
+            return
+        t1 = time.time()
+        print(f"  warm-up: prompt passes of {', '.join(map(str, TILE_ROWS))} ids in {t1 - t0:.2f} s "
+              f"(t {t0:.2f} to {t1:.2f})", flush=True)
 
     def _think(self, on, budget=None):
         """Set the engine's template flag and thinking budget for the request about to render."""
@@ -1303,7 +1317,12 @@ class Handler(BaseHTTPRequestHandler):
                                      usage_chunk, think, think_on)
         else:
             # X-Warmup: 1 marks the launcher's warm-up reply, which the counters and measured speeds leave out.
-            info = {"warmup": True} if self.headers.get("X-Warmup") == "1" else {}
+            # X-Warmup: tiles (a model's first start on this kernel folder, launch.tiles_marker) also asks for the prompt-width kernel passes.
+            warm = self.headers.get("X-Warmup")
+            info = {"warmup": True} if warm in ("1", "tiles") else {}
+            if warm == "tiles":
+                # Before the reply, so its own decode graphs and routed rows are the newest the caches hold.
+                self.host.warm_tiles(messages)
             try:
                 text = self.host.generate(messages, max_tokens, stream=False,
                                           tools=tools,

@@ -6,6 +6,8 @@ Short answers to the questions that come up most often. The main README has the 
 
 Before the model can write one word, it has to read the whole prompt. This is a pass over every prompt token through every layer, and it reads far more expert weights than a single reply token does. On the 16 GB M4 MacBook Pro, a 16k-token prompt took 45.6 s with the 35B's mixed research pack (2026-10-07) and 136.2 s with Flash-Next (2026-10-25); on the RTX 5060 Ti PC, the same prompt took 34.4 s with Flash-Next (2026-10-26). A short question is much quicker: 2.5 to 4.5 s for a question of 19 to 54 tokens with Flash-Next on the M4 (2026-10-14).
 
+The first request after a model's first start used to wait about 13 s more on the PC for kernels built on demand (2026-11-12). The launcher's warm-up now builds them before it says Ready, so that first start is longer once: by 47 s for Qwen3-4B and 111 s for Qwen3.6-35B (PC, 2026-11-13). A Mac's first start of a dense model went from 130 s to 11 to 16 s (Qwen3-4B, 16 GB M4, 2026-11-13).
+
 The second message of the same conversation is fast again, because the server keeps the conversation's state and reads only the new part.
 
 ## Why does it read from the SSD?

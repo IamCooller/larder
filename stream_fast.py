@@ -242,6 +242,14 @@ _ONECALL = os.environ.get("MOE_RESIDENT_ONECALL", "1") != "0"
 # MOE_RESIDENT_LM=K (MOE_RESIDENT on a GGUF pack whose layers the layer-major code cuts, 8 unless set, 0 or 1 off): a prefill runs K of the plan's pieces at a time layer-major, each piece's dense part and routing as its own pass computes them and the experts once over the K pieces' rows, so a miss crosses PCIe once per K pieces.
 _LMR_K = int(os.environ.get("MOE_RESIDENT_LM", "8")) if _RESIDENT else 0
 _LMR_BOUNDS = None      # the running layer-major run's pieces as position bounds (stack_call), None outside one
+# MOE_LM_PIPE=1 (off by default): in a MOE_RESIDENT_LM run, each piece's dense half and combine are queued while the one before finishes and the units are built in whole-array steps (same ops, same bits); the run also trims CUDA's pool between layers and runs again a piece shorter after an out-of-memory error; named apart from Flash-Next's _LM_PIPE below, which reads the same variable with another default.
+_LMR_PIPE = os.environ.get("MOE_LM_PIPE") == "1"
+# MOE_DENSE_INPLACE=1 (off by default): a resident prefill's dense-path groups read the store's rows in place by slot instead of a uint8 take of the group's rows first (same bytes, same kernels).
+_DENSE_INPLACE = os.environ.get("MOE_DENSE_INPLACE") == "1"
+# MOE_LM_DENSE_RUN=1 (off by default): in a MOE_RESIDENT_LM run the dense-path rows of every piece go in units over the whole run, each expert dequantized once a unit instead of once a piece's group (each row's path unchanged).
+_LM_DENSE_RUN = os.environ.get("MOE_LM_DENSE_RUN") == "1"
+# MOE_UNIT_SCATTER=1 (off by default): a run's units are written into the output by one scatter each, in a chain evaluated once, instead of a concatenation of every unit's rows and one scatter (same values, one copy fewer).
+_UNIT_SCATTER = os.environ.get("MOE_UNIT_SCATTER") == "1"
 # The fresh prefill the resident store leaves room for beside it, in min_w passes (MLX's sorted-kernel line, 128 positions on the 35B), since at two the 144-token bench prompt was cut in two pieces.
 RESIDENT_ROOM = 4
 # MOE_EMBED_VRAM (on under MOE_RESIDENT unless =0): the embedding table stays in device memory instead of a row read from the checkpoint and dequantized every token.
@@ -1626,6 +1634,29 @@ class MemBudget:
         """_lm_layer_call, at a layer's first combine: every row the layer holds (its input, MoE input and rows, output, the chunks' kept state, the new KV) is alive here (MemBudget.close's rows figure, beside the footprint's)."""
         self._rows_top = max(self._rows_top, mx.get_active_memory(), self._dev())
 
+    def _narrow(self, w, fresh, caches):
+        """MOE_LM_PIPE under a filled resident store: the forced width is the widest a piece takes, halved toward min_w
+        while the device (its pool cleared) does not hold the need tick() will read for it, so a short room narrows the
+        cut instead of shrinking the store (the wide cut's store shrank once a server on the coder prompts)."""
+        _eval_caches(caches)
+        copy, base, w0, seen = _copy(caches), _keys(caches), w, None
+        while w > self.min_w:
+            need = self._need(w, fresh, True, copy, base + w)
+            free = mx.device_info()["free_memory"] + mx.get_cache_memory()
+            if need is None or free >= need:
+                break
+            mx.synchronize()
+            mx.clear_cache()
+            free = mx.device_info()["free_memory"]
+            seen = seen or (need, free)
+            if free >= need:
+                break
+            w = max(self.min_w, w // 2)
+        if w < w0 and _RESIDENT_LOG:
+            print(f"  resident: a piece of {w0} needs {seen[0] / 1e9:.2f} GB with {seen[1] / 1e9:.2f} GB free (pool "
+                  f"cleared), cut to {w}", flush=True)
+        return w
+
     def plan(self, n, fresh, caches):
         """Positions of the first piece of a pass of `n`: all of them unless it is a prefill whose need does not fit even at pool 0, then as many as fit at the widest query chunk the room allows, with the rest planning again at its own entry and today's LM_W chunk and piece kept wherever they already fit."""
         if _KV_HOST:
@@ -1636,7 +1667,10 @@ class MemBudget:
             return n
         if _PIECE:
             # The golden harness's exactness check: a piece and chunk width forced from outside, to show a cut piece gives the whole pass's logits.
-            return min(n, max(self.min_w, _PIECE))
+            w = min(n, max(self.min_w, _PIECE))
+            if _LMR_PIPE and _RESIDENT and self.filled:
+                w = self._narrow(w, fresh, caches)
+            return w
         _eval_caches(caches)
         copy = _copy(caches)
         keys = _keys(caches) + n
@@ -2267,7 +2301,7 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
             whole = not caches or x.ndim < 2 or x.shape[0] != 1 or any(
                 isinstance(v, mx.array) for v in list(args)
                 + [v for key, v in kwargs.items() if key != "input_embeddings"])
-            ys, a = [], 0
+            ys, a, ran = [], 0, False
             bud.lm_ok = not whole
             try:
                 while a < n:
@@ -2286,31 +2320,68 @@ def enable_budget(model, peak_gb, cache_gb=0.0, t_max=1, calib=None):
                         w = bud.plan(n - a, fresh, caches)
                     bud.tick(w, fresh, caches)
                     # MOE_RESIDENT_LM: up to K pieces of the plan's width at once, layer-major, each the piece a token-major pass would be, once a piece's growth is known (the budget measures pieces only); a stoppable or resumed pass stays token-major.
-                    span = w
+                    span, snap, held = w, None, 0
                     if (bud.lmr and not whole and w < n - a and bud._is_prefill(w, fresh)
                             and bud.rate is not None and bud.state is not None
                             and PREFILL_STOP is None and PREFILL_SKIP is None):
-                        span = min(n - a, _lmr_pieces(bud, w) * w)
-                    # Cut here at the stack, so every caller's prefill (a front, a turn, MTP's) is the passes a caller-chunked one would be, and the rest plans again at its own entry.
-                    part, kw = (inputs, {}) if span == n else _cut(inputs, emb, a, a + span)
-                    if span > w:
-                        # A run of pieces is not measured as a piece (its growth would read as one piece's) but as a run, a position at a time.
-                        bud._pass = None
-                        _LMR_BOUNDS = [(c, min(c + w, span)) for c in range(0, span, w)]
-                        a0 = mx.get_active_memory()
-                        mx.reset_peak_memory()
-                    try:
-                        ys.append(orig(self, part, *args, **{**kwargs, **kw}))
-                    finally:
-                        _LMR_BOUNDS = None
+                        if _LMR_PIPE:
+                            # MOE_LM_PIPE: CUDA's pool gives back what the passes before left in it, so the plan reads the device's real room and the run's first layer begins on a trimmed pool.
+                            mx.synchronize()
+                            mx.clear_cache()
+                            # A run that runs out of device memory is put back from this and run again a piece shorter, its pieces and so its bits unchanged; what it holds stays through the run, a fixed part beside the run's growth a position.
+                            snap = _lmr_snap(caches)
+                            held = _lmr_held(snap)
+                        span = min(n - a, _lmr_pieces(bud, w, held) * w)
+                    if span <= w:
+                        snap, held = None, 0
+                    while True:
+                        # Cut here at the stack, so every caller's prefill (a front, a turn, MTP's) is the passes a caller-chunked one would be, and the rest plans again at its own entry.
+                        part, kw = (inputs, {}) if span == n else _cut(inputs, emb, a, a + span)
+                        if span > w:
+                            # A run of pieces is not measured as a piece (its growth would read as one piece's) but as a run, a position at a time.
+                            bud._pass = None
+                            _LMR_BOUNDS = [(c, min(c + w, span)) for c in range(0, span, w)]
+                            a0 = mx.get_active_memory()
+                            mx.reset_peak_memory()
+                            if _LMR_PIPE:
+                                room = mx.device_info()["free_memory"] + mx.get_cache_memory()
+                                bud._run = {"room": room, "low": float("inf"), "fresh": True, "layers": 0, "trims": 0,
+                                            "held": held}
+                        try:
+                            ys.append(orig(self, part, *args, **{**kwargs, **kw}))
+                            break
+                        except RuntimeError as e:
+                            if snap is None or "out of memory" not in str(e):
+                                raise
+                        finally:
+                            _LMR_BOUNDS = None
+                        # Past the except block, so the failed run's frames and arrays are let go before the caches are put back.
+                        mx.synchronize()
+                        _lmr_restore(caches, snap)
+                        mx.clear_cache()
+                        bud._top = 0
+                        bud.lmr_pos = max(bud.lmr_pos, (room - held) / (span - w))
+                        k = min(_lmr_pieces(bud, w, held), -(-span // w) - 1)
+                        print(f"  resident run: out of device memory at {span} positions in {room / 1e9:.2f} GB, "
+                              f"run again as {k} pieces", flush=True)
+                        span = min(n - a, k * w)
+                        if span <= w:
+                            snap, held = None, 0
                     if span > w:
                         # chunkattn's bracket resets the peak and keeps what it saw in _top; the run's buffers go back to the device, not to the decode after it.
-                        bud.lmr_pos = max(bud.lmr_pos, (max(bud._top, mx.get_peak_memory()) - a0) / span)
+                        bud.lmr_pos = max(bud.lmr_pos, (max(bud._top, mx.get_peak_memory()) - a0 - held) / span)
+                        if _LMR_PIPE:
+                            _lmr_end(bud, span)
+                            ran = True
                         mx.clear_cache()
                     a += span
                     if _R3 and a < n:
                         # R3: a lazy output held the last layer's hidden state ([w, 4 x 2560] on Flash-Next, ~20 KB a position) until the concatenation below, and evaluated it holds its own rows only (5 KB).
                         mx.eval(ys[-1])
+                if ran:
+                    # MOE_LM_PIPE: the pieces after the last run leave their fragments in CUDA's pool through the reply, so the pool goes back to the device once the pass is done.
+                    mx.synchronize()
+                    mx.clear_cache()
             finally:
                 # chunkattn reads it only inside a pass, since held past it, it kept a swapped-out engine (and its model) alive and a swapped-in model's attention read the old budget.
                 _MEASURING = None
@@ -2355,11 +2426,43 @@ def _copy(caches):
 
 def _eval_caches(caches):
     """Evaluate every array `caches` hold, a no-op once they are, since a front restored from SSD is lazy until then (MemBudget's `held`)."""
-    mx.eval([a for c in caches
-             for a in (c.cache if isinstance(c, ArraysCache)
-                       else kv_host.pass_arrays(c) if getattr(c, "kv_host", False)
-                       else (getattr(c, "keys", None), getattr(c, "values", None)))
-             if a is not None])
+    mx.eval(_cache_arrays(caches))
+
+
+def _cache_arrays(caches):
+    return [a for c in caches
+            for a in (c.cache if isinstance(c, ArraysCache)
+                      else kv_host.pass_arrays(c) if getattr(c, "kv_host", False)
+                      else (getattr(c, "keys", None), getattr(c, "values", None)))
+            if a is not None]
+
+
+def _lmr_snap(caches):
+    """MOE_LM_PIPE: references to what a layer-major run changes in each cache (a recurrent cache's arrays, a KV cache's
+    buffers and offset), or None when a cache is of a type this does not know, so no run is retried over it."""
+    snap = []
+    for c in caches:
+        if type(c) is ArraysCache:
+            snap.append(list(c.cache))
+        elif type(c) is KVCache:
+            snap.append((c.keys, c.values, c.offset))
+        else:
+            return None
+    return snap
+
+
+def _lmr_held(snap):
+    """Bytes the arrays of a _lmr_snap snapshot hold, which the run would otherwise free as it replaces them (0 without one)."""
+    return sum(a.nbytes for s in snap or () for a in (s if isinstance(s, list) else s[:2]) if a is not None)
+
+
+def _lmr_restore(caches, snap):
+    """Put back what _lmr_snap took, so a run that failed part way through leaves every layer's cache as it found it."""
+    for c, s in zip(caches, snap):
+        if isinstance(s, list):
+            c.cache = list(s)
+        else:
+            c.keys, c.values, c.offset = s
 
 
 def cache_state(c):
@@ -4264,6 +4367,50 @@ def check_equivalence(block, wrapper, dim):
             f"lambda 0: mlx-lm's block has changed, update CacheBiasedMoE")
 
 
+def _lmr_groups_ref(pos, piece, n_pieces, half):
+    """MOE_RESIDENT_LM's groups, piece by piece: (rows into pos, experts into unique_ids) of up to `half` experts each."""
+    groups = []
+    for c in range(n_pieces):
+        sel = np.flatnonzero(piece == c)
+        uc = np.unique(pos[sel])
+        for i in range(0, len(uc), half):
+            g = uc[i:i + half]
+            groups.append((sel[(pos[sel] >= g[0]) & (pos[sel] <= g[-1])], g))
+    return groups
+
+
+def _lmr_groups(pos, piece, n_pieces, half):
+    """_lmr_groups_ref in whole-array steps (pos ascending within a piece), the same groups in the same order."""
+    order = np.argsort(piece, kind="stable")
+    pc, pp = piece[order], pos[order]
+    head = np.r_[True, pc[1:] != pc[:-1]]
+    new = head | np.r_[True, pp[1:] != pp[:-1]]
+    rank = np.cumsum(new) - 1
+    rank -= rank[np.flatnonzero(head)][np.cumsum(head) - 1]
+    gi = rank // half
+    cut = np.flatnonzero(head | np.r_[True, gi[1:] != gi[:-1]])
+    rows = np.split(order, cut[1:])
+    exps = np.split(pp[new], np.searchsorted(np.flatnonzero(new), cut[1:]))
+    return list(zip(rows, exps))
+
+
+def _miss_rounds_ref(on, pos, cmiss, per):
+    return [(np.flatnonzero(on & np.isin(pos, cmiss[i:i + per])), cmiss[i:i + per], None)
+            for i in range(0, len(cmiss), per)]
+
+
+def _miss_rounds(on, pos, cmiss, per):
+    """_miss_rounds_ref with each row's round looked up once: the chain rows of every `per` misses, ascending."""
+    rnd = np.full(int(max(pos.max(initial=0), cmiss.max(initial=0))) + 1, -1)
+    rnd[cmiss] = np.arange(len(cmiss)) // per
+    r = np.where(on, rnd[pos], -1)
+    idx = np.flatnonzero(r >= 0)
+    idx = idx[np.argsort(r[idx], kind="stable")]
+    n = -(-len(cmiss) // per)
+    parts = np.split(idx, np.cumsum(np.bincount(r[idx], minlength=n))[:-1])
+    return [(parts[j], cmiss[j * per:(j + 1) * per], None) for j in range(n)]
+
+
 def _wide_out(out, n_rows, y):
     """The wide pass's unsorted output buffer, made on the first write in the dtype gather_qmm actually returned."""
     if out is None:
@@ -4721,6 +4868,14 @@ class StreamingSwitchGLU(nn.Module):
                 mx.eval(out)
         return out
 
+    def _dense_only(self, x, bufs, host):
+        """gguf_experts.experts' dense branch without its switch, for MOE_LM_DENSE_RUN's units (their rows' pieces chose it)."""
+        types = tuple(self._gguf.split("/")) if isinstance(self._gguf, str) else tuple(self._gguf)
+        hid = x.shape[-1]
+        host = np.asarray(host).reshape(-1)
+        y = gguf_experts.dense(x.reshape(-1, hid), tuple(b[0] for b in bufs), host, types, x.dtype)
+        return y.reshape(len(host), 1, hid)
+
     def _take_group(self, ids, store, copy=True, ring=None):
         """MOE_RESIDENT, _call_grouped's group without the release: the rows _batch_wide would read (the span lo..hi when
         dense, else the ids) gathered from the store, the ids it does not hold first copied into ring rows (_fetch, or
@@ -4793,13 +4948,7 @@ class StreamingSwitchGLU(nn.Module):
         else:
             # MOE_RESIDENT_LM: each piece's rows grouped as the piece's own pass groups them, so a row takes the path (dense or chain) it takes there.
             piece = np.searchsorted([a for a, _ in lmr], np.array(rows) // k, "right") - 1
-            groups = []
-            for c in range(len(lmr)):
-                sel = np.flatnonzero(piece == c)
-                uc = np.unique(pos[sel])
-                for i in range(0, len(uc), half):
-                    g = uc[i:i + half]
-                    groups.append((sel[(pos[sel] >= g[0]) & (pos[sel] <= g[-1])], g))
+            groups = (_lmr_groups if _LMR_PIPE else _lmr_groups_ref)(np.asarray(pos), piece, len(lmr), half)
         # A unit: its rows (indices into pos), its misses (indices into unique_ids, ascending), and a taken group's experts or None on the chain.
         units, hit, cmiss, chain = [], [], [], []
         for r, g in groups:
@@ -4812,14 +4961,23 @@ class StreamingSwitchGLU(nn.Module):
                 chain.append(r)
             else:
                 units.append((r, m, None))
+        if _LM_DENSE_RUN and lmr is not None and any(u[2] is not None for u in units):
+            # MOE_LM_DENSE_RUN: the rows each piece sent dense, regrouped by expert over the whole run (half its experts a unit, so the misses fit a ring half); a row's path is its piece's and its bits do not depend on its call's other rows (measured on CUDA and Metal).
+            dr = np.sort(np.concatenate([u[0] for u in units if u[2] is not None]))
+            ue = np.unique(pos[dr])
+            merged = []
+            for i in range(0, len(ue), half):
+                g = ue[i:i + half]
+                r = dr[(pos[dr] >= g[0]) & (pos[dr] <= g[-1])]
+                merged.append((r, g[~inq[g]], g))
+            units = merged + [u for u in units if u[2] is None]
         if cmiss:
             # Pieces share experts, so a miss is copied once for every piece's chain rows.
             hit, cmiss = np.sort(np.concatenate(hit)), np.unique(np.concatenate(cmiss))
             on = np.zeros(len(pos), bool)
             on[np.concatenate(chain)] = True
             per = half if _OVERLAP else 2 * half
-            rounds = [(np.flatnonzero(on & np.isin(pos, cmiss[i:i + per])), cmiss[i:i + per], None)
-                      for i in range(0, len(cmiss), per)]
+            rounds = (_miss_rounds if _LMR_PIPE else _miss_rounds_ref)(on, np.asarray(pos), cmiss, per)
             # Under OVERLAP the quota rows are cut into as many pieces as there are rounds, so each round's copy runs under a piece.
             hits = [(h, cmiss[:0], None) for h in np.array_split(hit, max(1, len(rounds) if _OVERLAP else 1)) if len(h)]
             units += [u for j in range(max(len(hits), len(rounds))) for u in hits[j:j + 1] + rounds[j:j + 1]]
@@ -4855,14 +5013,23 @@ class StreamingSwitchGLU(nn.Module):
             return self._fetch(unique_ids[m], store, base[i])
 
         ring, reads = fetch(0) if units else None, None
+        run_dense = _LM_DENSE_RUN and lmr is not None
         for i, (r, m, a) in enumerate(units):
             dst, src0 = dst_all[cut[i]:cut[i + 1]], src_all[cut[i]:cut[i + 1]]
             if a is not None:
                 ids = unique_ids[a]
                 pg = np.searchsorted(a, pos[r])
-                bufs, lo, _ = self._take_group(ids, store, ring=ring)
-                h = ids[pg] - lo if lo is not None else pg
-                y, reads = self._experts(src0, bufs, mx.array(h), False, h)[2], None
+                if _DENSE_INPLACE:
+                    # The dense path reads each row's expert at its store slot (a ring row for a miss), as the chain does, with no take of the group's rows.
+                    _, lo, sl = self._take_group(ids, store, copy=False, ring=ring)
+                    h = sl[ids[pg] - lo if lo is not None else pg].astype(np.uint32)
+                    y = self._dense_only(src0, own, h) if run_dense else self._experts(src0, own, mx.array(h), False, h)[2]
+                    reads = base[i] // half if len(m) else None
+                else:
+                    bufs, lo, _ = self._take_group(ids, store, ring=ring)
+                    h = ids[pg] - lo if lo is not None else pg
+                    y = self._dense_only(src0, bufs, h) if run_dense else self._experts(src0, bufs, mx.array(h), False, h)[2]
+                    reads = None
             else:
                 y = self._experts(src0, own, dev[c0:c0 + len(r)])[2]
                 c0 += len(r)
@@ -4884,7 +5051,11 @@ class StreamingSwitchGLU(nn.Module):
         if ys:
             # MOE_RESIDENT_LM: one scatter of every unit's rows, since a copy of a run's whole output a unit held ~20 of them at once.
             out = _wide_out(out, n_rows, ys[0][1])
-            out[mx.concatenate([d for d, _ in ys])] = mx.concatenate([v for _, v in ys])
+            if _UNIT_SCATTER:
+                for d, v in ys:
+                    out[d] = v
+            else:
+                out[mx.concatenate([d for d, _ in ys])] = mx.concatenate([v for _, v in ys])
         if reads is not None or any(b is not None for b in busy):
             # A unit that read ring rows is evaluated even when last, so no later copy lands under it.
             mx.eval(out)
@@ -7462,12 +7633,16 @@ def _lm_layer_call(layer, args, kwargs, lmr=None):
             rp["prev_pre"] = (rp["T"], sum(rp["pre"]) / len(rp["pre"]))
         rp["win"], rp["pre"], rp["T"] = [], [], T
         _lm_start(layer, glu, args)
+    pipe = _LMR_PIPE and lmr is not None
+    if pipe:
+        _lmr_layer(_MEASURING, T)
     t0, w0 = time.perf_counter(), TIMERS["lm_wait"]
     rp["t0"] = t0
     # The width the budget planned this pass at (MemBudget.plan), LM_W unless the keys left no room for a chunk that wide.
     w = getattr(_MEASURING, "lm_w", LM_W) if _MEASURING is not None else LM_W
     bounds = lmr or [(a, min(a + w, T)) for a in range(0, T, w)]
     xs, keeps, inds = [], [], []
+    queued = []
 
     def capture(x, idx):
         inds.append(idx)
@@ -7477,7 +7652,14 @@ def _lm_layer_call(layer, args, kwargs, lmr=None):
     def step(t):
         x, keep = moe_in(t)
         mlp(x)
-        _lm_eval([x, keep, inds[-1]], caches)
+        if pipe:
+            # This piece is queued and the one before waited on, so the next piece's graph is built under this one's work.
+            mx.async_eval([x, keep, inds[-1]], _cache_arrays(caches))
+            if queued:
+                mx.eval(queued.pop())
+            queued.append([x, keep, inds[-1]])
+        else:
+            _lm_eval([x, keep, inds[-1]], caches)
         xs.append(x)
         keeps.append(keep)
         return x
@@ -7491,6 +7673,8 @@ def _lm_layer_call(layer, args, kwargs, lmr=None):
     finally:
         ane_split.ACTIVE = False
         glu.__dict__.pop("_lm", None)
+    if queued:
+        _lm_eval(queued.pop(), caches)
     cat = (lambda v: v[0] if len(v) == 1 else mx.concatenate(v, axis=1))
     if lmr is not None:
         glu.__dict__["_lmr"] = lmr      # _call_resident groups each piece's rows as the piece's own pass does
@@ -7515,7 +7699,10 @@ def _lm_layer_call(layer, args, kwargs, lmr=None):
             if out is None:
                 out = mx.zeros((o.shape[0], T) + o.shape[2:], dtype=o.dtype)
             out[:, a:b] = o
-        mx.eval(out)
+        if pipe and 0 < i < len(bounds) - 1:
+            mx.async_eval(out)
+        else:
+            mx.eval(out)
         if i == 0:
             _MEASURING.lm_rows()
     # The window a read ahead hides behind (_lm_whole): this layer's time outside its waits for reads, with the process's first left out (_lm_count).
@@ -7526,11 +7713,47 @@ def _lm_layer_call(layer, args, kwargs, lmr=None):
     return out
 
 
-def _lmr_pieces(bud, w):
-    """MOE_RESIDENT_LM: how many pieces of `w` positions a run takes, up to _LMR_K: as many as the device's free memory
-    holds at the growth a position of a run was measured at (lmr_pos), or a token-major piece's (rate) until then."""
-    per = (bud.lmr_pos or bud.rate) * w
+def _lmr_layer(bud, T):
+    """MOE_LM_PIPE, before each layer of a resident layer-major run after its first: CUDA's pool, which keeps earlier
+    layers' freed blocks that this layer's requests do not fit, goes back to the device when the device holds less than
+    the run's planned growth, and a layer begun on a trimmed pool leaves the device's low, its draw with the pool's
+    fragments, in `bud._run`."""
+    run = bud._run
+    run["layers"] += 1
+    if run["layers"] == 1:
+        return
     free = mx.device_info()["free_memory"] + mx.get_cache_memory()
+    if run["fresh"]:
+        run["low"] = min(run["low"], free)
+    run["fresh"] = free < (bud.lmr_pos or bud.rate) * T + run["held"]
+    if run["fresh"]:
+        mx.synchronize()
+        mx.clear_cache()
+        run["trims"] += 1
+
+
+def _lmr_end(bud, span):
+    """MOE_LM_PIPE, after a resident run: the device's own draw a position (the room it began with less its low where a
+    layer began on a trimmed pool) raises the run's growth a position past MLX's figure, which leaves out the pool's
+    fragments."""
+    run = bud._run
+    free = mx.device_info()["free_memory"] + mx.get_cache_memory()
+    if run["fresh"]:
+        run["low"] = min(run["low"], free)
+    if run["low"] < run["room"]:
+        bud.lmr_pos = max(bud.lmr_pos, (run["room"] - run["low"] - run["held"]) / span)
+    if _RESIDENT_LOG:
+        print(f"  resident run: {span} positions, {run['trims']} pool trims in {run['layers']} layers, lowest "
+              f"{run['low'] / 1e9:.2f} GB free of {run['room'] / 1e9:.2f}, snapshot {run['held'] / 1e6:.0f} MB, "
+              f"{bud.lmr_pos / 1e3:.0f} KB a position from now", flush=True)
+
+
+def _lmr_pieces(bud, w, held=0):
+    """MOE_RESIDENT_LM: how many pieces of `w` positions a run takes, up to _LMR_K: as many as the device's free memory
+    (less `held`, what MOE_LM_PIPE's snapshot keeps through the run) holds at the growth a position of a run was
+    measured at (lmr_pos), or a token-major piece's (rate) until then."""
+    per = (bud.lmr_pos or bud.rate) * w
+    free = mx.device_info()["free_memory"] + mx.get_cache_memory() - held
     k = max(1, min(_LMR_K, int(free // per))) if per > 0 else 1
     if _RESIDENT_LOG:
         print(f"  resident run: {k} pieces of {w}, {free / 1e9:.2f} GB free, {per / w / 1e3:.0f} KB a position "

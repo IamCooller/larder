@@ -491,12 +491,14 @@ def mark_ready(d, e):
                                                 indent=1))
 
 
-def validate(port, max_tokens=24, warm=False, api_key=None):
+def validate(port, max_tokens=24, warm=False, api_key=None, tiles=False):
     """One short reply (text, "") or (None, the reason it failed): the check of a freshly made variant and,
-    marked `warm`, the warm-up every start runs before it says ready, which the server's counters leave out."""
+    marked `warm`, the warm-up every start runs before it says ready, which the server's counters leave out;
+    `tiles` asks the server for its prompt-width kernel passes too (CUDA)."""
     body = json.dumps({"messages": [{"role": "user", "content": "Say hello in one short sentence."}],
                        "max_tokens": max_tokens}).encode()
-    headers = {"Content-Type": "application/json", **({"X-Warmup": "1"} if warm else {}),
+    headers = {"Content-Type": "application/json",
+               **({"X-Warmup": "tiles" if tiles else "1"} if warm else {}),
                **({"Authorization": "Bearer " + api_key} if api_key else {})}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", body, headers)
     try:
@@ -1366,13 +1368,37 @@ def start_note(last, kernels=None):
             "once, then answers one short warm-up message (later starts are shorter)")
 
 
-def warm_up(port, api_key=None):
+def tiles_marker(s, d):
+    """The file in MLX's kernel folder of the plan that says model folder `d`'s prompt-width kernels are built, None
+    without such a folder (Metal, or a user's own MLX_PTX_CACHE_DIR); a new kernel key wipes it (kernel_cache)."""
+    k = s.get("env", {}).get("MLX_PTX_CACHE_DIR")
+    if not k or Path(k).parent.name != "mlx-kernels":
+        return None
+    # Keyed on the folder's name, which is unique under the models folder; two folders of one name would need a path hash.
+    return Path(k) / f"tiles-{Path(d).name}"
+
+
+def warm_request(port, marker=None, api_key=None):
+    """The warm-up reply, asking the server for its prompt-width kernel passes while `marker` is missing and writing
+    the marker once the reply came; (ok, why)."""
+    tiles = marker is not None and not marker.exists()
+    text, why = validate(port, max_tokens=8, warm=True, api_key=api_key, tiles=tiles)
+    ok = text is not None or why == "an empty reply"     # 8 tokens of thinking leave no answer, and that is fine
+    if ok and tiles:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError:
+            pass                # the next start asks again
+    return ok, why
+
+
+def warm_up(port, api_key=None, marker=None):
     """One short reply before ready, so the engine's first-use work (kernel builds, its store's fill, the MTP
     rounds' warm-up) is not the user's first message; a failure is said and never stops the start."""
     t = time.time()
     print("\n  warming up: one short reply...", end="", flush=True)
-    text, why = validate(port, max_tokens=8, warm=True, api_key=api_key)
-    ok = text is not None or why == "an empty reply"     # 8 tokens of thinking leave no answer, and that is fine
+    ok, why = warm_request(port, marker, api_key)
     print(f" {time.time() - t:.0f} s" if ok else f" failed ({why})", flush=True)
     return ok
 
@@ -1395,6 +1421,24 @@ def start_server(d, s, port, log, quiet=False, host="127.0.0.1", api_key=None):
     return subprocess.Popen(cmd, cwd=HERE, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT)
 
 
+def loading_text(log, t0):
+    """'loading the model... N s', plus what the log says the engine is measuring right now."""
+    text = f"loading the model... {time.time() - t0:.0f} s"
+    try:
+        with open(log, errors="replace") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 4000))
+            lines = f.read().splitlines()
+    except OSError:
+        return text
+    for line in reversed(lines):
+        if line.strip().startswith("kernels measured"):
+            break
+        if line.strip().startswith("measuring this Mac's"):
+            return f"{text}  ({line.strip()})"
+    return text
+
+
 def wait_ready(proc, port, log, limit=3600, api_key=None):
     t0 = time.time()
     headers = {"Authorization": "Bearer " + api_key} if api_key else {}
@@ -1407,7 +1451,7 @@ def wait_ready(proc, port, log, limit=3600, api_key=None):
             with urllib.request.urlopen(req, timeout=2) as r:
                 return json.load(r)["data"][0]["id"]
         except (OSError, ValueError, KeyError, IndexError):
-            print(f"\r  loading the model... {time.time() - t0:.0f} s", end="", flush=True)
+            print(f"\r\033[K  {loading_text(log, t0)}", end="", flush=True)
             time.sleep(1)
     raise SystemExit(f"The engine did not answer in {limit} s; log: {log}")
 
@@ -1681,12 +1725,12 @@ class TuiBackend(tui.Backend):
                     model_id = json.load(r)["data"][0]["id"]
                 break
             except (OSError, ValueError, KeyError, IndexError):
-                job.say(f"loading the model... {time.time() - t0:.0f} s")
+                job.say(loading_text(self.log, t0))
                 time.sleep(1)
             if time.time() - t0 > 3600:
                 raise RuntimeError(f"the engine did not answer in an hour; log: {self.log}")
         job.say("warming up: one short reply, so the first message does not wait for the engine's first-use work")
-        validate(port, max_tokens=8, warm=True)
+        warm_request(port, tiles_marker(s, d))
         if e.get("make_bits") and not is_ready(d):          # made here: offered once it has answered
             job.say("checking the copy made here with one short reply")
             text, why = validate(port)
@@ -2364,7 +2408,7 @@ def serve(args, e, d, s, est, variant, unattended, shown=None):
     signal.signal(signal.SIGTERM, stop)
     try:
         model_id = wait_ready(proc, port, log, api_key=args.api_key)
-        if warm_up(port, args.api_key) and not cold:     # a start that built the kernels is no guide to the next
+        if warm_up(port, args.api_key, tiles_marker(s, d)) and not cold:     # a start that built the kernels is no guide to the next
             start_seconds(d, time.time() - t0)
         if e.get("make_bits") and not is_ready(d):    # made here: offered once it has answered
             text, why = validate(port, api_key=args.api_key)

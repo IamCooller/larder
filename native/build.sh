@@ -6,6 +6,12 @@
 # mlx other than 0.32.2 (the extension uses MLX internals of that version).
 set -euo pipefail
 : "${1:?usage: native/build.sh <path-to-python>}"
+# moe_native is Metal code; the CUDA agent (native/moe_pipe_cuda.py) builds itself at its first import.
+if [ "$(uname -s)" != Darwin ]; then
+  echo "build.sh: moe_native is macOS only, nothing to build here; on Linux the CUDA agent builds at first use," \
+    "check it from the repo folder with: PYTHONPATH=native $1 -c 'import moe_pipe_cuda'"
+  exit 0
+fi
 # Absolute, venv path kept (cmake takes a relative one as not found).
 PY=$("$1" -c 'import sys; print(sys.executable)')
 HERE=$(cd "$(dirname "$0")" && pwd)

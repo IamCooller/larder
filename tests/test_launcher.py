@@ -1325,6 +1325,7 @@ def check_cuda_q40(tmp):
         launch.mtp_for = real_mtp
     assert s["args"][-6:] == ["--cache-bias", "0.5", "--bias-budget", "0.2", "--mtp", str(d / launch.MTP_PACK)], s["args"]
     assert s["env"]["ENGINE_BIAS_GATED"] == "1" and s["env"]["MOE_RESIDENT"] == "1" and est["tps"] > 0, s["env"]
+    assert s["env"]["MOE_LM_PIPE"] == "1" and s["env"]["MOE_PIECE"] == "1024", s["env"]     # the gated wide cut
     assert "--mtp" not in bare["args"]
 
     # --delete on CUDA: either id names the recipe's folder; the 4-bit key the 4-bit pack where it was found;
