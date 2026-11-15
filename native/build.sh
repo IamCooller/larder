@@ -33,10 +33,15 @@ if [ ! -x "$CMAKE" ]; then
   CMAKE=$(find_cmake)
 fi
 
+# Two linker notes come from the mlx wheel (built on a newer macOS and Xcode than this machine) and change nothing; only they are dropped.
+quiet_ld() {
+  "$@" 2>&1 | sed -E "/^ld: warning: (search path '.*\/System\/Library\/Frameworks' not found|building for macOS-[0-9.]+, but linking with dylib '@rpath\/libmlx.dylib' which was built for newer version)/d"
+}
+
 BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 "$CMAKE" -S "$HERE" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$PY"
-"$CMAKE" --build "$BUILD" -j "$(sysctl -n hw.ncpu)"
+quiet_ld "$CMAKE" --build "$BUILD" -j "$(sysctl -n hw.ncpu)"
 DEST=$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')
 rm -f "$DEST"/moe_native*.so
 cp "$BUILD"/moe_native*.so "$DEST"/
@@ -60,4 +65,4 @@ build_ane() {
     -L"$mlx/lib" -lmlx -Wl,-rpath,"$mlx/lib" -framework Foundation -framework IOSurface -framework Metal \
     -o "$DEST/_ane_mlx$ext" && echo "_ane_mlx installed: $DEST/_ane_mlx$ext"
 }
-build_ane || echo "build.sh: _ane_mlx not built, the ANE prefill overlap stays off" >&2
+quiet_ld build_ane || echo "build.sh: _ane_mlx not built, the ANE prefill overlap stays off" >&2

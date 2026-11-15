@@ -1605,6 +1605,11 @@ def check_first_reply(tmp):
     assert launch.start_note(40.2, False).startswith("  about 40 s")
     assert "builds its kernels once" in launch.start_note(None, True) and "builds" in launch.start_note(None, None)
     assert "kept from an earlier start" in launch.start_note(None, False)     # the start after a cold one
+    assert "few minutes" in launch.start_note(None, True)                      # a first start says it takes a while
+    import logging
+    rec = lambda m: logging.LogRecord("huggingface_hub.utils._http", logging.WARNING, "f", 1, m, None, None)
+    hf = logging.getLogger("huggingface_hub.utils._http")
+    assert not hf.filter(rec("You are sending unauthenticated requests to the HF Hub.")) and hf.filter(rec("rate limited"))
     print("30. MLX's CUDA kernels kept in mlx-kernels/<MLX version>-<key of GPU, driver, nvrtc> (MLX_PTX_CACHE_DIR), "
           "other keys removed, the user's own setting kept; a start with an empty folder says it builds them; "
           "Metal sets nothing")

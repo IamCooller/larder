@@ -5,6 +5,7 @@ URL."""
 import argparse
 import collections
 import json
+import logging
 import os
 import queue
 import re
@@ -29,6 +30,9 @@ import tuner
 import tui
 
 engine_log.set_verbose(False)   # the engine's debugging notes stay out of the launcher's output
+
+# The Hub's "unauthenticated requests" notice (a server warning header) is dropped; other Hub warnings stay.
+logging.getLogger("huggingface_hub.utils._http").addFilter(lambda r: "unauthenticated requests" not in r.getMessage())
 
 HERE = Path(__file__).resolve().parent
 # The pack tools live in tools/; the launcher drives them.
@@ -1365,7 +1369,7 @@ def start_note(last, kernels=None):
     if kernels is False:
         return "  loading the model, then one short warm-up message (its GPU kernels are kept from an earlier start)"
     return ("  first start of this model on this computer: the engine measures the GPU and builds its kernels "
-            "once, then answers one short warm-up message (later starts are shorter)")
+            "once, which can take a few minutes, then answers one short warm-up message (later starts are shorter)")
 
 
 def tiles_marker(s, d):
@@ -1418,7 +1422,8 @@ def start_server(d, s, port, log, quiet=False, host="127.0.0.1", api_key=None):
         print(f"\nStarting the engine: {' '.join(f'{k}={v}' for k, v in s['env'].items())} "
               f"server.py --model {d} --port {port} --host {host} {' '.join(s['args'])}", flush=True)
         print(f"  (log: {log})", flush=True)
-    return subprocess.Popen(cmd, cwd=HERE, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT)
+    return subprocess.Popen(cmd, cwd=HERE, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT,
+                            start_new_session=True)      # a closed chat or Ctrl+C in the shell must not reach the server
 
 
 def loading_text(log, t0):
@@ -2393,6 +2398,9 @@ def serve(args, e, d, s, est, variant, unattended, shown=None):
     if server_info()[1]:                       # one model at a time, on the one chat port
         stop_server()
     cold = kernel_cache(s)
+    marker = tiles_marker(s, d)
+    if cold is False and not marker.exists():
+        cold = True                           # the folder is kept but this model has not built its own kernels yet
     proc = start_server(d, s, port, log, quiet=unattended, host=args.host, api_key=args.api_key)
     t0 = time.time()
     print(start_note(start_seconds(d), cold), flush=True)
@@ -2406,9 +2414,11 @@ def serve(args, e, d, s, est, variant, unattended, shown=None):
                 proc.kill()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)        # the server has its own session now, so a closed terminal must stop it here
+    detached = False
     try:
         model_id = wait_ready(proc, port, log, api_key=args.api_key)
-        if warm_up(port, args.api_key, tiles_marker(s, d)) and not cold:     # a start that built the kernels is no guide to the next
+        if warm_up(port, args.api_key, marker) and not cold:     # a start that built the kernels is no guide to the next
             start_seconds(d, time.time() - t0)
         if e.get("make_bits") and not is_ready(d):    # made here: offered once it has answered
             text, why = validate(port, api_key=args.api_key)
@@ -2434,19 +2444,22 @@ def serve(args, e, d, s, est, variant, unattended, shown=None):
         else:
             terminal_chat(f"http://127.0.0.1:{port}")
             print(f"The server keeps running for the browser and other apps. Stop it: {stop_hint()}")
+            detached = True               # the shell comes back and the server stays up
+            return
         proc.wait()
         if watch:
             watch.stop()
     except KeyboardInterrupt:
         print("\nStopping the engine...")
     finally:
-        if proc.poll() is None:
+        if not detached and proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(30)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        clear_server(proc.pid)
+        if not detached:
+            clear_server(proc.pid)
 
 
 if __name__ == "__main__":
