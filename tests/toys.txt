@@ -43,6 +43,7 @@ tests/test_mtp_next.py
 tests/test_prefill_logits.py
 tests/test_qsa_attn.py
 tests/test_qsa_pool.py
+tests/test_sdpa_gqa.py
 tests/test_readpath.py
 tests/test_route_cuda.py
 tests/test_route_kernel.py

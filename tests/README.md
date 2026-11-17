@@ -68,7 +68,7 @@ It sends every item greedy to both endpoints, scores it (GSM8K by the number aft
 | Memory-aware routing and the 3-bit pack do not lower quality | `quality_gate.py`, baseline against candidate |
 | Sampling matches plain sampling's distribution | `test_sampling.py` (chi-square against the exact joint distribution) |
 | The chat page, the API and editor clients change no reply | `golden_check.py` through each client's endpoint, `test_webchat.py`, `test_anthropic_api.py` |
-| Long-context kernels leave the cache bit-identical | `test_qsa_attn.py`, `test_qsa_pool.py`, `test_foldattn.py`, `test_chunkattn.py` |
+| Long-context kernels leave the cache bit-identical | `test_qsa_attn.py`, `test_qsa_pool.py`, `test_foldattn.py`, `test_chunkattn.py`, `test_sdpa_gqa.py` |
 | Memory stays under the budget | `test_store*.py`, `test_governor.py`, `test_server_memory.py` |
 
 ## Tools
@@ -94,6 +94,7 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_foldattn.py` | Folded GQA attention for multi-row verify passes against stock SDPA and an fp32 reference. | toy | - | 13 s | `python3 tests/test_foldattn.py` |
 | `test_chunkattn.py` | Query-chunked prefill attention for head dim 256 against the full computation, numerics and peak memory. | toy | - | under 10 s | `python3 tests/test_chunkattn.py` |
 | `test_qsa_attn.py` | QSA picks-only decode attention equals MLX's masked SDPA over the picks, bit for bit. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_qsa_attn.py` |
+| `test_sdpa_gqa.py` | Grouped-head decode attention (`MOE_SDPA_GQA`) equals MLX's two-pass vector SDPA bit for bit; calls outside it reach stock; its identity guard and install timing. | toy, Metal, MLX 0.32.2 | - | under 10 s | `python3 tests/test_sdpa_gqa.py` |
 | `test_qsa_pool.py` | The QSA indexer's kept pooled keys equal stock's re-pooled keys. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_qsa_pool.py` |
 | `test_layer_glue.py` | layer_glue kernels equal the stock lines they replace, bit for bit, at Flash-Next shapes. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_layer_glue.py` |
 | `test_prefill_glue.py` | The prefill-row glue kernels equal the stock lines over 1-2048 rows, each with a mutant that must be caught. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_prefill_glue.py` |

@@ -1054,7 +1054,7 @@ class SpeedWatch(threading.Thread):
 
 def fit_line(text, n=78):
     """text cut or padded to n columns, for a line rewritten in place."""
-    return text if len(text) >= n else text.ljust(n)
+    return text[:n].ljust(n)
 
 
 def idle_profile(prof):

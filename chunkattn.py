@@ -3,7 +3,11 @@
 import hashlib
 import io
 import json
+import math
+import os
+import statistics
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -434,6 +438,10 @@ _warned_over_budget = False
 def _wrap(stock):
     def scaled_dot_product_attention(queries, keys, values, cache, scale, mask,
                                      sinks=None):
+        grouped = _gqa_route(queries, keys, cache, mask, sinks, stock)
+        if grouped is not None:
+            return _gqa_first(queries, keys, gqa_sdpa(queries, keys, values, scale, *grouped), grouped,
+                              lambda: stock(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks))
         found = _route(queries, keys, cache, mask, sinks)
         if found is None:
             return stock(queries, keys, values, cache=cache, scale=scale,
@@ -505,6 +513,281 @@ def _wrap(stock):
     # fully handled, calibrating here would only be thrown away).
     scaled_dot_product_attention.chunkattn = True
     return scaled_dot_product_attention
+
+
+# MOE_SDPA_GQA (Metal, on; 0 turns it off): a decode or MTP-verify call MLX would run with its two-pass vector SDPA runs a replay of
+# sdpa_vector_2pass_1 in which one simdgroup serves HPT q heads of a kv group per K/V load, with stock's bits.
+GQA_ON = stream_fast.BACKEND == "metal" and os.environ.get("MOE_SDPA_GQA", "1") == "1"
+GQA_HPT = (2, 4, 8)         # q heads a simdgroup the install times against stock
+GQA_T = (1, 2, 3, 4)        # query rows in the envelope
+GQA_DIMS = (96, 256)        # MLX 0.32.2's vector SDPA head dims with no sdpa_vector_2pass_1_gqa kernel of its own
+GQA_N0 = 4096               # the timing grid starts here and doubles
+GQA_NMAX = 65536            # and ends here, or lower where the K/V buffer would pass GQA_BYTES
+GQA_BYTES = 256e6           # the install's K/V buffer, shared by every timed call
+GQA_CHAIN = 4               # calls a timed chain, each on its own stretch of the buffer where it is long enough
+GQA_REPS = 3                # timed chains an arm and cell, the median kept
+
+# (Hq, Hkv, D, dtype) -> {T: [(keys, q heads a simdgroup), ...]}, timed at install; 1 is stock.
+gqa = {}
+
+# sdpa_vector_2pass_1 of MLX 0.32.2 with HPT q heads of a kv group a simdgroup: each head's float ops in stock's order.
+_GQA_PASS1 = """
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  typedef float U;
+
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int kv_head_idx = threadgroup_position_in_grid.x;
+  const int block_idx = threadgroup_position_in_grid.z;
+  const int q_seq_idx = thread_position_in_threadgroup.z;
+  const int h_base = GQA * kv_head_idx + HPT * int(thread_position_in_threadgroup.y);
+  const int N = prm[0];
+  const int64_t kss = kc_strides[2];
+  const int64_t vss = vc_strides[2];
+
+  const device T* keys = kc + kv_head_idx * kc_strides[1] + block_idx * kss + simd_lid * qk_per_thread;
+  const device T* values = vc + kv_head_idx * vc_strides[1] + block_idx * vss + simd_lid * v_per_thread;
+
+  U q[HPT][qk_per_thread];
+  U o[HPT][v_per_thread];
+  U max_score[HPT];
+  U sum_exp_score[HPT];
+#pragma clang loop unroll(full)
+  for (int j = 0; j < HPT; j++) {
+    const device T* queries = qr + (h_base + j) * qr_strides[1] + q_seq_idx * qr_strides[2] + simd_lid * qk_per_thread;
+    for (int e = 0; e < qk_per_thread; e++) {
+      q[j][e] = static_cast<U>(scl[0]) * queries[e];
+    }
+    for (int e = 0; e < v_per_thread; e++) {
+      o[j][e] = 0;
+    }
+    max_score[j] = Limits<U>::finite_min;
+    sum_exp_score[j] = 0;
+  }
+  const int last = N - QL + q_seq_idx;
+
+  for (int i = block_idx; i < N; i += P) {
+    if (!CAUSAL || i <= last) {
+      T kr[qk_per_thread];
+      T vr[v_per_thread];
+      for (int e = 0; e < qk_per_thread; e++) {
+        kr[e] = keys[e];
+      }
+      for (int e = 0; e < v_per_thread; e++) {
+        vr[e] = values[e];
+      }
+#pragma clang loop unroll(full)
+      for (int j = 0; j < HPT; j++) {
+        U score = 0;
+        for (int e = 0; e < qk_per_thread; e++) {
+          score += q[j][e] * kr[e];
+        }
+        score = simd_sum(score);
+        U new_max = max(max_score[j], score);
+        U factor = fast::exp(max_score[j] - new_max);
+        U exp_score = fast::exp(score - new_max);
+        max_score[j] = new_max;
+        sum_exp_score[j] = sum_exp_score[j] * factor + exp_score;
+        for (int e = 0; e < v_per_thread; e++) {
+          o[j][e] = o[j][e] * factor + exp_score * vr[e];
+        }
+      }
+    }
+    keys += P * kss;
+    values += P * vss;
+  }
+
+#pragma clang loop unroll(full)
+  for (int j = 0; j < HPT; j++) {
+    const int row = ((h_base + j) * QL + q_seq_idx) * P + block_idx;
+    if (simd_lid == 0) {
+      sums[row] = sum_exp_score[j];
+      maxs[row] = max_score[j];
+    }
+    for (int e = 0; e < v_per_thread; e++) {
+      part[row * V + simd_lid * v_per_thread + e] = static_cast<T>(o[j][e]);
+    }
+  }
+"""
+_gqa_kernel = []
+
+
+def gqa_sdpa(q, k, v, scale, hpt, parts):
+    """mx.fast.scaled_dot_product_attention(q, k, v, scale, mask=None or "causal") of batch 1 and T <= 4 rows, bit for bit where MLX runs its two-pass kernel over `parts` partitions."""
+    if not _gqa_kernel:
+        _gqa_kernel.append(mx.fast.metal_kernel(
+            name="sdpa_gqa_1", input_names=["qr", "kc", "vc", "prm", "scl"],
+            output_names=["part", "sums", "maxs"], source=_GQA_PASS1, ensure_row_contiguous=False))
+    H, T, D = q.shape[1], q.shape[2], q.shape[3]
+    Hk, V = k.shape[1], v.shape[3]
+    G = H // Hk
+    part, sums, maxs = _gqa_kernel[0](
+        inputs=[q, k, v, mx.array([k.shape[2]], mx.int32), mx.array([scale], mx.float32)],
+        template=[("T", q.dtype), ("D", D), ("V", V), ("P", parts), ("GQA", G), ("HPT", hpt),
+                  ("QL", T), ("CAUSAL", T > 1)],
+        grid=(32 * Hk, G // hpt, parts * T), threadgroup=(32, G // hpt, T),
+        output_shapes=[(H * T, parts, V), (H * T, parts), (H * T, parts)],
+        output_dtypes=[q.dtype, mx.float32, mx.float32])
+    return stream_fast._qsa_kernel("pass2")(
+        inputs=[part, sums, maxs], template=[("T", q.dtype), ("D", V), ("P", parts)],
+        grid=(1024 * H * T, 1, 1), threadgroup=(1024, 1, 1),
+        output_shapes=[(1, H, T, V)], output_dtypes=[q.dtype])[0]
+
+
+# (Hq, Hkv, D, dtype, T, q heads a simdgroup, partitions) whose first engine call gave stock's bits.
+_gqa_ok = set()
+
+
+def _gqa_first(q, k, out, grouped, ref):
+    """`out`, except that the first call of each grouping and partition count is also run by stock (`ref`), and a difference returns stock's result and turns the shape off."""
+    key = (q.shape[1], k.shape[1], q.shape[3], str(q.dtype), q.shape[2], *grouped)
+    if key in _gqa_ok:
+        return out
+    r = ref()
+    if mx.array_equal(out, r).item():
+        _gqa_ok.add(key)
+        return out
+    gqa.pop(key[:4], None)
+    print(f"  decode attention: {key[0]}/{key[1]}x{key[2]} T={key[4]} over {key[6]} partitions differs from "
+          f"stock at {k.shape[2]} keys; stock from here on", flush=True)
+    return r
+
+
+def _gqa_route(q, k, cache, mask, sinks, stock):
+    """(q heads a simdgroup, partitions) for a call inside MOE_SDPA_GQA's envelope that the install timed faster than stock, else None."""
+    if not gqa:
+        return None
+    B, H, T, D = q.shape
+    if (T > 4 or B != 1 or sinks is not None or hasattr(cache, "bits")
+            or not (mask is None and T == 1 or isinstance(mask, str) and mask == "causal")
+            or (T > 1 and hasattr(stock, "foldattn"))):
+        return None
+    rows = gqa.get((H, k.shape[1], D, str(q.dtype)))
+    if rows is None or k.dtype != q.dtype or k.shape[0] != 1 or not rows.get(T):
+        return None
+    N = k.shape[2]
+    parts = stream_fast._sdpa_parts(H, k.shape[1], N)
+    if parts is None:
+        return None
+    hpt = min(rows[T], key=lambda r: abs(math.log2(N / r[0])))[1]
+    return None if hpt == 1 else (hpt, parts)
+
+
+def _gqa_time(fns):
+    """Median ms of each fn's chain (lazy outputs, synced by mx.eval), the fns interleaved rep by rep."""
+    for f in fns:
+        mx.eval(f())
+    ts = [[] for _ in fns]
+    for _ in range(GQA_REPS):
+        for j, f in enumerate(fns):
+            t0 = time.perf_counter()
+            mx.eval(f())
+            ts[j].append((time.perf_counter() - t0) * 1e3)
+    return [statistics.median(t) for t in ts]
+
+
+def _gqa_nmax(hkv, d, dtype, cap):
+    """The widest key count of the timing grid whose K/V buffer fits `cap` bytes, or None when not even GQA_N0 does."""
+    nmax = GQA_NMAX
+    while nmax > GQA_N0 and 2 * hkv * (nmax + 256) * d * dtype.size > cap:
+        nmax //= 2
+    return nmax if 2 * hkv * (nmax + 256) * d * dtype.size <= cap else None
+
+
+def _gqa_calibrate(hq, hkv, d, dtype, nmax=None):
+    """{T: [(keys, q heads a simdgroup)]} for one shape, {} unless every grouping gives stock's bits at odd key counts on strided slices: each timed against stock at doubling key counts up to `nmax` over distinct stretches of one K/V buffer."""
+    g = hq // hkv
+    hpts = [h for h in GQA_HPT if g % h == 0]
+    nmax = nmax or _gqa_nmax(hkv, d, dtype, GQA_BYTES)
+    # Own keys, so the engine's global random state is left as it was.
+    ks = mx.random.split(mx.random.key(hq * 1000 + d), 3)
+    kb = mx.random.normal((1, hkv, nmax + 256, d), dtype, key=ks[0])
+    vb = mx.random.normal((1, hkv, nmax + 256, d), dtype, key=ks[1])
+    qs = {t: mx.random.normal((1, hq, t, d), dtype, key=ks[2]) for t in GQA_T}
+    for a in (kb, vb, qs):         # one at a time, so the generator's float32 transients never coexist
+        mx.eval(a)
+    scale = d ** -0.5
+
+    def stock(q, k, v):
+        return mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=scale, mask=None if q.shape[2] == 1 else "causal")
+
+    for n in (GQA_N0 + 77, nmax - 3):
+        parts = stream_fast._sdpa_parts(hq, hkv, n)
+        if parts is None:
+            continue
+        k, v = kb[:, :, :n], vb[:, :, :n]
+        for t in GQA_T:
+            ref = stock(qs[t], k, v)
+            if not all(mx.array_equal(ref, gqa_sdpa(qs[t], k, v, scale, h, parts)).item() for h in hpts):
+                return {}
+    rows = {}
+    n = GQA_N0
+    while n <= nmax:
+        parts = stream_fast._sdpa_parts(hq, hkv, n)
+        if parts is not None:
+            spans = [(kb[:, :, o:o + n], vb[:, :, o:o + n]) for o in range(0, nmax + 257 - n, n)]
+            chain = [spans[i % len(spans)] for i in range(GQA_CHAIN)]
+            for t in GQA_T:
+                q = qs[t]
+                fns = [lambda: [stock(q, k, v) for k, v in chain]]
+                fns += [lambda h=h: [gqa_sdpa(q, k, v, scale, h, parts) for k, v in chain] for h in hpts]
+                ms = _gqa_time(fns)
+                rows.setdefault(t, []).append((n, ([1] + hpts)[ms.index(min(ms))]))
+        n *= 2
+    return rows
+
+
+def _gqa_install(shapes, dtype):
+    """MOE_SDPA_GQA's table for the model's shapes in its envelope, reused from disk or measured and kept, and the note saying what was chosen."""
+    global gqa
+    gqa = {}
+    if stream_fast.BACKEND != "metal":
+        return None
+    if not GQA_ON:
+        return "stock (MOE_SDPA_GQA=0)"
+    hsum = stream_fast._sdpa_hdr()
+    if hsum != stream_fast._SDPA_HDR or mx.__version__ not in stream_fast._SDPA_MLX:
+        return f"stock (sdpa_vector.h {hsum}, MLX {mx.__version__}: not the ones replayed)"
+    shapes = sorted((hq, hkv, d) for hq, hkv, d in shapes if d in GQA_DIMS and hq % hkv == 0 and hq > hkv)
+    if dtype not in (mx.bfloat16, mx.float16) or not shapes:
+        return f"stock (no grouped {dtype} shape without MLX's own grouped kernel)"
+    t0 = time.perf_counter()
+    src = hashlib.sha1((_GQA_PASS1 + stream_fast._QSA_PASS2).encode()).hexdigest()[:12]
+    said = []
+    for hq, hkv, d in shapes:
+        key = json.dumps([mx.device_info()["device_name"], mx.__version__, src, hq, hkv, d, str(dtype),
+                          GQA_HPT, GQA_N0, GQA_NMAX, GQA_BYTES, GQA_CHAIN, GQA_REPS])
+        path = LAYOUT_DIR / f"sdpagqa-{hashlib.sha1(key.encode()).hexdigest()[:16]}.json"
+        try:
+            rows = {int(t): [tuple(r) for r in v] for t, v in json.loads(path.read_text())["rows"].items()}
+        except (OSError, ValueError, KeyError):
+            # Under a memory budget the buffer gets a quarter of the room free now: half, as a prefill chunk takes, and the generator's peak is twice the buffer.
+            room = stream_fast.prefill_room()
+            nmax = _gqa_nmax(hkv, d, dtype, GQA_BYTES if room is None else min(GQA_BYTES, room / 4))
+            if nmax is None:
+                said.append(f"{hq}/{hkv}x{d} stock (its smallest timing buffer is "
+                            f"{2 * hkv * (GQA_N0 + 256) * d * dtype.size / 1e6:.0f} MB, a quarter of the budget's free "
+                            f"room is {max(room, 0) / 4e6:.0f} MB now; a start with room calibrates)")
+                continue
+            rows = _gqa_calibrate(hq, hkv, d, dtype, nmax)
+            mx.clear_cache()
+            try:
+                # A grid the budget cut short is used by this process but not kept.
+                if nmax == _gqa_nmax(hkv, d, dtype, GQA_BYTES):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps({"rows": rows, "key": key}))
+                    tmp.replace(path)
+            except OSError as e:
+                print(f"  decode attention: could not save its calibration to {path}: {e}", flush=True)
+        if rows:
+            gqa[(hq, hkv, d, str(dtype))] = rows
+        said.append(f"{hq}/{hkv}x{d} " + ("; ".join(
+            f"T={t} " + " ".join(f"{n >> 10}k:{'stock' if h == 1 else f'h{h}'}" for n, h in r)
+            for t, r in sorted(rows.items())) or "stock (no grouping gave stock's bits)"))
+    return f"grouped heads {', '.join(said)} ({time.perf_counter() - t0:.1f} s)"
 
 
 def _heads(m):
@@ -617,6 +900,9 @@ def install(model, table=None, verbose=False):
         if not hasattr(mod.scaled_dot_product_attention, "chunkattn"):
             mod.scaled_dot_product_attention = _wrap(mod.scaled_dot_product_attention)
     layout = table
+    said = _gqa_install(shapes, dtype)
+    if said:
+        note(f"  decode attention: {said}")
     note("  prefill attention: chunkattn "
           + (", ".join(f"{hq}/{hkv}x{d} >= {v[1]} rows" + (", causal keys" if v[2:3] and v[2] else "")
                         for (hq, hkv, d), v in sorted(table.items()))
