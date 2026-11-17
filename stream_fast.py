@@ -5848,6 +5848,17 @@ _SDPA_HDR = "b9a50bf47996"
 _SDPA_MLX = ("0.32.2",)
 
 
+def _sdpa_hdr():
+    """The first 12 hex digits of the sha1 of the installed MLX's sdpa_vector.h, or None if it cannot be read."""
+    hdr = os.path.join(os.path.dirname(mx.__file__), "include", "mlx", "backend", "metal",
+                       "kernels", "sdpa_vector.h")
+    try:
+        with open(hdr, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
 def _sdpa_parts(n_heads, n_kv_heads, n_keys):
     """How many partitions MLX 0.32.2's vector SDPA splits a one-query decode over n_keys keys into (sdpa_vector_2pass, scaled_dot_product_attention.cpp), or None where it runs its one-pass kernel."""
     devc = mx.device_info()["architecture"][-1]
@@ -6254,13 +6265,7 @@ def _install_qsa_attn(q4, select, pooled_cache):
             note(f"  qsa attention: stock (Attention {src}: not the one replayed)", flush=True)
             return
     else:
-        hdr = os.path.join(os.path.dirname(mx.__file__), "include", "mlx", "backend", "metal",
-                           "kernels", "sdpa_vector.h")
-        try:
-            with open(hdr, "rb") as f:
-                hsum = hashlib.sha1(f.read()).hexdigest()[:12]
-        except OSError:
-            hsum = None
+        hsum = _sdpa_hdr()
         if src != _QSA_ATTN_SRC or hsum != _SDPA_HDR or mx.__version__ not in _SDPA_MLX:
             note(f"  qsa attention: stock (Attention {src}, sdpa_vector.h {hsum}, "
                   f"MLX {mx.__version__}: not the ones replayed)", flush=True)

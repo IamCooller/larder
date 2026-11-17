@@ -1665,6 +1665,14 @@ def check_exl3_resume(tmp, src):
     print("24. EXL3 install resumes after a stopped experts shard: the trunk not made again, no zeros in experts.bin")
 
 
+def check_fit_line():
+    """Fit line pads shorter text and cuts longer text to exactly n columns."""
+    assert launch.fit_line("short") == "short" + " " * 73
+    assert launch.fit_line("x" * 78) == "x" * 78
+    assert launch.fit_line("abc" * 40) == ("abc" * 40)[:78]
+    print("21. fit_line: pads shorter, cuts longer to exactly n columns")
+
+
 def check_live_speed():
     """The launcher reads the running server's /status: the measured speed over its replies beside the
     estimate it made, and the conditions under it; the same number the web header and the monitor show."""
@@ -2252,6 +2260,7 @@ def main():
     check_estimate()
     check_bits_estimate()
     check_live_speed()
+    check_fit_line()
     print("test_launcher: ok")
 
 
