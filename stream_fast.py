@@ -673,6 +673,9 @@ class ArenaGovernor:
         self._roof_avail = None # memory that was free when the roof was set
         self._calm = 0          # consecutive quiet windows since the roof was set
         self._settled = False   # a size above this one measured worse
+        # Context length the engine sets at each turn's start, and the log2 bucket the rates on record were measured in.
+        self.ctx = 0
+        self._ctx_b = 0
         # Two lanes, because the two jobs have opposite deadlines: giving memory back has to be immediate (two sysctl reads at ~1 us against a ~38 ms token) while finding the fastest arena is the opposite, each probe costing ~30 tokens of re-warming, so the guard lane runs every `guard_period` tokens and may only SHRINK and the speed lane runs every `period` tokens and is the only thing allowed to grow.
         self.guard_period = guard_period
         # Swap safety: kern.memorystatus_level alone overstated the room by several GB because it counts non-compressed memory only and macOS swaps once that falls under two thirds of what the compressor occupies, which _margin() takes off, while how far this process itself drags the machine toward the line is measured from its own quiet windows against the lowest reading inside each prefill and that is the reserve.
@@ -887,6 +890,15 @@ class ArenaGovernor:
             want = self.cap
         else:
             # Bigger is monotonically faster here (21->64->96 slots measured 21.6->25.9->27.0 tok/s), so jump straight to the roof rather than stepping, since every resize costs ~30 tokens of re-warming and stepping paid that repeatedly for no benefit.
+            # Decode slows with the context (22.0 -> 13.1 tok/s from 20k to 80k on the 35B), so rates measured in another log2 bucket of it are forgotten rather than compared.
+            if self.ctx.bit_length() != self._ctx_b:
+                self._ctx_b = self.ctx.bit_length()
+                self._rate.clear()
+                if self._settled:
+                    # A settle is a speed verdict from the old bucket too, so it goes with the rates, while a roof the pressure set keeps its own slow release.
+                    self._settled = False
+                    if self._roof_avail is None:
+                        self._roof = self.cap_max
             self._rate[self.cap] = max(self._rate.get(self.cap, 0.0), rate)
             want = self._roof
             # A jump that measures >10% below the best smaller size on record (5x the window noise) means this size crowds the page cache the streaming path reads through, so fall back to the best MEASURED size rather than halfway to it (halving landed on 96 at 24.1 tok/s, worse than sizes on record) and stop probing upward.
@@ -3436,6 +3448,11 @@ def _wide_scratch(role, parts, rows):
 
 # Prefill read-ahead: a layer whose grouped path runs reads the NEXT layer's whole expert region into the other of two sets on the pool while its own gathers and the next attention run, since a prefill pass's layer selects nearly all of its experts and reading them on the model thread after the routing sync left the GPU idle (~4 s a pass on the 35B).
 _IN_PREFILL = False
+# MOE_PREFILL_LAST_KV (on, 0 off): in a pass moe_stream._prefill makes (CACHE_ONLY), whose outputs nothing reads, the last layer runs only the half that writes its cache, its experts are not read ahead, and chunkattn hands its attention back unevaluated (_KV_ONLY).
+# CUDA runs the same code but it is untested there, so it stays opt-in on CUDA (MOE_PREFILL_LAST_KV=1).
+LAST_KV = os.environ.get("MOE_PREFILL_LAST_KV", "1" if BACKEND == "metal" else "0") == "1"
+CACHE_ONLY = False
+_KV_ONLY = False
 _LAYER_SETS = [None, None]   # (shape key, {role: (bufs, views)}) per parity
 _AHEAD = None                # (glu, parity, futures, issued at, bytes) of the read in flight
 
@@ -3593,6 +3610,8 @@ def _whole_layer(glu, ids, T):
         if nb:
             _ema("rate_u", nb / (time.perf_counter() - t))
     nxt = glu.__dict__.get("_wide_next")
+    if CACHE_ONLY and nxt is not None and nxt.__dict__.get("_prefill_last"):
+        nxt = None
     if nxt is not None and _ahead_pays(glu, nxt, ids):
         futs, nb = _read_layer(nxt, 1 - i)
         _AHEAD = (nxt, 1 - i, futs, time.perf_counter(), nb)
@@ -7854,7 +7873,7 @@ def lm_supported(model):
 
 def _prefill_layer_call(orig, layer, args, kwargs):
     """One decoder layer of a prefill pass, its lazy tails forced before the next layer is built, so a lazy slice of a long input is taken inside the layer and the MoE tail does not coexist with the next layer's attention."""
-    global _IN_PREFILL, _PREFILL_AT
+    global _IN_PREFILL, _PREFILL_AT, _KV_ONLY
     bud = _MEASURING
     if _LMR_BOUNDS is not None and layer.__dict__.get("_lmr_on"):
         return _lm_layer_call(layer, args, kwargs, _LMR_BOUNDS)
@@ -7864,9 +7883,15 @@ def _prefill_layer_call(orig, layer, args, kwargs):
         _PREFILL_AT = _layer_at(layer, args, kwargs)
     _prefill_stop()
     halves = _halves(layer)
+    kv_only = CACHE_ONLY and halves is not None and layer.__dict__.get("_prefill_last")
     _IN_PREFILL = True
     try:
-        if halves is None:
+        if kv_only:
+            # MOE_PREFILL_LAST_KV: only the cache is evaluated below, and the layer's input stands in for the output nothing reads.
+            _KV_ONLY = True
+            halves[0](*args, **kwargs)
+            out = args[0]
+        elif halves is None:
             out = orig(layer, *args, **kwargs)
         else:
             h = halves[0](*args, **kwargs)
@@ -7878,8 +7903,9 @@ def _prefill_layer_call(orig, layer, args, kwargs):
                 _prefill_stop()
             out = halves[1](h)
     finally:
-        _IN_PREFILL = False
-    mx.eval(out, _recurrent_states(args, kwargs))
+        _IN_PREFILL = _KV_ONLY = False
+    mx.eval(out, [cache_state(c) for c in _caches_in(args, kwargs)] if kv_only
+            else _recurrent_states(args, kwargs))
     _PREFILL_AT = None
     if layer.__dict__.get("_prefill_last"):
         _WIDE_SCRATCH.clear()
@@ -8184,6 +8210,9 @@ def install(model, model_path, resident=0, look_m=0, look_depth=1, cache_bias=0.
     for a, b in zip(fused_layers, fused_layers[1:]):
         # The prefill read-ahead's next layer (_whole_layer).
         _glu_of(model.layers[a]).__dict__["_wide_next"] = _glu_of(model.layers[b])
+    if fused_layers and fused_layers[-1] == len(model.layers) - 1:
+        # MOE_PREFILL_LAST_KV: the read-ahead skips this one in a cache-only pass.
+        _glu_of(model.layers[fused_layers[-1]]).__dict__["_prefill_last"] = True
     for a, b in zip(fused_layers, fused_layers[look_depth:]):
         glu = _glu_of(model.layers[a])
         glu._next_gate = _ranker_of(_moe_of(model.layers[b]))

@@ -347,7 +347,16 @@ def _trim_floor(hq, hkv, d, dtype, min_rows):
     return floor
 
 
-def chunked(q, k, v, scale, rows, min_rows, floor=0, mask=None):
+def _bounds(T, rows, min_rows):
+    """chunked()'s chunk edges over T rows: `rows` apart, a last chunk under min_rows folded into the one before."""
+    rows = max(rows, min_rows)
+    bounds = list(range(0, T, rows)) + [T]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < min_rows:
+        bounds.pop(-2)
+    return bounds
+
+
+def chunked(q, k, v, scale, rows, min_rows, floor=0, mask=None, fused=False):
     """Same result as mx.fast.scaled_dot_product_attention(q, k, v,
     scale=scale, mask="causal") when q's T rows are the last T of k/v's N
     (mlx_lm's own bottom-right convention: row r sees keys 0..N-T+r) --
@@ -382,13 +391,14 @@ def chunked(q, k, v, scale, rows, min_rows, floor=0, mask=None):
     bought nothing. This is the prefill path (under --mem-peak-gb also a
     pass whose room runs short), where the engine already syncs per layer,
     so an extra sync per chunk is not new latency shape.
+
+    `fused` (MOE_PREFILL_SOFTMAX, causal only): a chunk over more than
+    LOOPED keys runs _fused_core, the same fallback with its mask and
+    softmax as one in-place pass.
     """
     T, N = q.shape[2], k.shape[2]
     offset = N - T
-    rows = max(rows, min_rows)
-    bounds = list(range(0, T, rows)) + [T]
-    if len(bounds) > 2 and bounds[-1] - bounds[-2] < min_rows:
-        bounds.pop(-2)
+    bounds = _bounds(T, rows, min_rows)
     outs = []
     for c0, c1 in zip(bounds, bounds[1:]):
         if c0:
@@ -396,15 +406,18 @@ def chunked(q, k, v, scale, rows, min_rows, floor=0, mask=None):
             # one stretch of a layer with no other check (0.9 s at 12k).
             stream_fast._prefill_stop()
         nk = _cut(offset + c1, N, floor) if floor else N
-        if mask is None:
-            row_pos = offset + c0 + mx.arange(c1 - c0)
-            col_pos = mx.arange(nk)
-            m = row_pos[:, None] >= col_pos[None, :]
-        else:
-            m = mask[..., c0:c1, :nk]
         kc, vc = (k, v) if nk == N else (k[:, :, :nk], v[:, :, :nk])
-        out = mx.fast.scaled_dot_product_attention(
-            q[:, :, c0:c1], kc, vc, scale=scale, mask=m)
+        if fused and mask is None and nk > LOOPED:
+            out = _fused_core(q[:, :, c0:c1], kc, vc, scale, offset + c0)
+        else:
+            if mask is None:
+                row_pos = offset + c0 + mx.arange(c1 - c0)
+                col_pos = mx.arange(nk)
+                m = row_pos[:, None] >= col_pos[None, :]
+            else:
+                m = mask[..., c0:c1, :nk]
+            out = mx.fast.scaled_dot_product_attention(
+                q[:, :, c0:c1], kc, vc, scale=scale, mask=m)
         mx.eval(out)
         outs.append(out)
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
@@ -438,6 +451,9 @@ _warned_over_budget = False
 def _wrap(stock):
     def scaled_dot_product_attention(queries, keys, values, cache, scale, mask,
                                      sinks=None):
+        if stream_fast._KV_ONLY:
+            # The last layer of a cache-only prefill pass (stream_fast.LAST_KV): nothing evaluates this attention.
+            return stock(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
         grouped = _gqa_route(queries, keys, cache, mask, sinks, stock)
         if grouped is not None:
             return _gqa_first(queries, keys, gqa_sdpa(queries, keys, values, scale, *grouped), grouped,
@@ -493,16 +509,22 @@ def _wrap(stock):
             # dividing by queries.shape[1] here too would double-count heads
             # and undersize rows by that factor.
             rows = max(min_rows, int(cap // (N * per_key)) or 1)
+        arr = not isinstance(mask, str)
+        # MOE_PREFILL_SOFTMAX: a causal call it serves runs fused at the width its install timed, one chunk or many.
+        width = None if arr else _sm_width(queries, keys)
+        if width:
+            rows = min(rows, width)
         # A shape that measured unfused at calibration may still fuse at
         # this T, and stock's own kernel is then bounded already and the only
         # kernel with its bits.
-        arr = not isinstance(mask, str)
-        if rows >= T or _stock_fused(queries.shape[1], keys.shape[1],
-                                     queries.shape[3], queries.dtype, T, N, arr):
+        if (rows >= T and width is None) or _stock_fused(queries.shape[1], keys.shape[1],
+                                                         queries.shape[3], queries.dtype, T, N, arr):
             return stock(queries, keys, values, cache=cache, scale=scale,
                          mask=mask, sinks=sinks)
         if arr:
             return chunked(queries, keys, values, scale, rows, min_rows, *floor, mask=mask)
+        if width is not None:
+            return _sm_first(queries, keys, values, scale, min(rows, T), min_rows, floor)
         return chunked(queries, keys, values, scale, rows, min_rows, *floor)
     scaled_dot_product_attention.stock = stock
     # A second, chunkattn-specific marker: foldattn.py sets .stock too (the
@@ -790,6 +812,247 @@ def _gqa_install(shapes, dtype):
     return f"grouped heads {', '.join(said)} ({time.perf_counter() - t0:.1f} s)"
 
 
+# MOE_PREFILL_SOFTMAX (Metal, on; 0 turns it off): a causal prefill chunk over more than LOOPED keys runs MLX's fallback with
+# its mask `where` and precise softmax as one in-place pass in MLX 0.32.2's own order, at the row width the install timed fastest.
+SM_ON = stream_fast.BACKEND == "metal" and os.environ.get("MOE_PREFILL_SOFTMAX", "1") == "1"
+SM_MLX = ("0.32.2",)        # MLX versions whose fallback (fast.cpp) and softmax dispatch (softmax.cpp) were read
+SM_HDR = "596ecf82e84e"     # sha1 of the kernels/softmax.h whose softmax_looped the kernel replays
+SM_LSIZE = 1024             # threads a row: MLX's looped softmax runs 1024 on Metal and its 32-slot combine assumes it
+SM_ROWS = (64, 128, 256, 512)               # widths the install times under the engine's own
+SM_T = 1024                 # rows a timed pass takes: the tail of a pass, every chunk over about N keys
+SM_N = (8192, 16384, 32768, 65536)          # keys the timing grid runs at
+SM_CHECK = ((300, 4160, 64), (200, 8191, 48), (130, 16390, 100))   # (rows, keys, width) of the install's bit check
+
+# softmax_looped<T, float, 4> of MLX 0.32.2 (kernels/softmax.h) over s's rows in place, each element first replaced as
+# where(mask, s, finfo(T).min) replaces it, row r of a chunk seeing keys <= prm[2] + r.
+_SM_SRC = """
+  constexpr int N_READS = 4;
+  constexpr int SIMD_SIZE = 32;
+  typedef float AccT;
+  const uint gid = threadgroup_position_in_grid.x;
+  const uint lid = thread_position_in_threadgroup.x;
+  const uint lsize = threads_per_threadgroup.x;
+  const uint simd_lane_id = thread_index_in_simdgroup;
+  const uint simd_group_id = simdgroup_index_in_threadgroup;
+  const int axis_size = prm[0];
+  const int lim = prm[2] + int(gid % uint(prm[1]));
+  const T fill = Limits<T>::finite_min;
+
+  const device T* in = s + gid * size_t(axis_size);
+  device T* out = (device T*)s + gid * size_t(axis_size);
+
+  threadgroup AccT local_max[SIMD_SIZE];
+  threadgroup AccT local_normalizer[SIMD_SIZE];
+  const int rounds = static_cast<int>(ceildiv(axis_size, N_READS * lsize));
+
+  AccT prevmax;
+  AccT maxval = Limits<AccT>::finite_min;
+  AccT normalizer = 0;
+  for (int r = 0; r < rounds; r++) {
+    int offset = r * lsize * N_READS + lid * N_READS;
+    AccT vals[N_READS];
+    for (int i = 0; i < N_READS; i++) {
+      T x = offset + i <= lim ? in[offset + i] : fill;
+      vals[i] = (offset + i < axis_size) ? AccT(x) : Limits<AccT>::min;
+    }
+    prevmax = maxval;
+    for (int i = 0; i < N_READS; i++) {
+      maxval = (maxval < vals[i]) ? vals[i] : maxval;
+    }
+    normalizer *= metal::fast::exp(prevmax - maxval);
+    for (int i = 0; i < N_READS; i++) {
+      normalizer += metal::fast::exp(vals[i] - maxval);
+    }
+  }
+  prevmax = maxval;
+  maxval = simd_max(maxval);
+  normalizer *= metal::fast::exp(prevmax - maxval);
+  normalizer = simd_sum(normalizer);
+  prevmax = maxval;
+  if (simd_lane_id == 0) {
+    local_max[simd_group_id] = maxval;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  maxval = simd_max(local_max[simd_lane_id]);
+  normalizer *= metal::fast::exp(prevmax - maxval);
+  if (simd_lane_id == 0) {
+    local_normalizer[simd_group_id] = normalizer;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  normalizer = simd_sum(local_normalizer[simd_lane_id]);
+  normalizer = 1 / normalizer;
+
+  for (int r = 0; r < rounds; r++) {
+    int offset = r * lsize * N_READS + lid * N_READS;
+    for (int i = 0; i < N_READS; i++) {
+      if (offset + i < axis_size) {
+        T x = offset + i <= lim ? in[offset + i] : fill;
+        out[offset + i] = T(metal::fast::exp(x - maxval) * normalizer);
+      }
+    }
+  }
+  if (gid == 0 && lid == 0) {
+    p[0] = T(0);
+  }
+"""
+_sm_kernel = []
+
+# (Hq, Hkv, D, dtype) -> [(keys, width)] timed at install, width 0 where the engine's own was fastest.
+sm = {}
+# Shapes whose first routed call gave the stock fallback's bits.
+_sm_ok = set()
+
+
+def _softmax_hdr():
+    """The first 12 hex digits of the sha1 of the installed MLX's softmax.h, or None if it cannot be read."""
+    try:
+        p = os.path.join(os.path.dirname(mx.__file__), "include", "mlx", "backend", "metal", "kernels", "softmax.h")
+        with open(p, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+def _fused_core(q, k, v, scale, off0):
+    """mx.fast.scaled_dot_product_attention's fallback (MLX 0.32.2 fast.cpp) for one causal chunk whose row r sees keys
+    <= off0 + r, with the mask and the precise softmax as one pass written over the score buffer."""
+    if not _sm_kernel:
+        _sm_kernel.append(mx.fast.metal_kernel(
+            name="mask_softmax", input_names=["s", "prm"], output_names=["p"], source=_SM_SRC,
+            ensure_row_contiguous=False))
+    B, H, R, D = q.shape
+    hk = k.shape[1]
+    q = mx.array(scale, q.dtype) * q
+    if H != hk:
+        q = q.reshape(B, hk, H // hk, R, D)
+        k, v = mx.expand_dims(k, 2), mx.expand_dims(v, 2)
+    s = q @ k.swapaxes(-1, -2)
+    nk = s.shape[-1]
+    # MLX does not see the kernel write s, so the kernel is evaluated before the value GEMM reads s.
+    mx.eval(_sm_kernel[0](
+        inputs=[s, mx.array([nk, R, off0], mx.int32)], template=[("T", s.dtype)],
+        grid=(s.size // nk * SM_LSIZE, 1, 1), threadgroup=(SM_LSIZE, 1, 1),
+        output_shapes=[(1,)], output_dtypes=[s.dtype]))
+    return (s @ v).reshape(B, H, R, v.shape[-1])
+
+
+def _sm_width(q, k):
+    """The row width the install timed fastest at this call's keys (0: the engine's own), or None where the fused pass does not run."""
+    if not sm or q.shape[0] != 1 or k.shape[2] <= LOOPED:
+        return None
+    rows = sm.get((q.shape[1], k.shape[1], q.shape[3], str(q.dtype)))
+    if not rows:
+        return None
+    return min(rows, key=lambda r: abs(math.log2(k.shape[2] / r[0])))[1]
+
+
+def _sm_first(q, k, v, scale, rows, min_rows, floor):
+    """chunked()'s fused pass, except that the first call of each shape also runs its last chunk on the stock fallback,
+    and a difference returns the stock pass and turns the shape off."""
+    out = chunked(q, k, v, scale, rows, min_rows, *floor, fused=True)
+    key = (q.shape[1], k.shape[1], q.shape[3], str(q.dtype))
+    if key in _sm_ok:
+        return out
+    T = q.shape[2]
+    c0 = _bounds(T, rows, min_rows)[-2]
+    ref = chunked(q[:, :, c0:], k, v, scale, T - c0, min_rows, *floor)
+    if mx.array_equal(out[:, :, c0:], ref).item():
+        _sm_ok.add(key)
+        return out
+    sm.pop(key, None)
+    print(f"  prefill softmax: {key[0]}/{key[1]}x{key[2]} differs from the stock fallback at {k.shape[2]} keys; "
+          f"stock from here on", flush=True)
+    return chunked(q, k, v, scale, rows, min_rows, *floor)
+
+
+def _sm_exact(hq, hkv, d, dtype, min_rows, floor):
+    """True if the fused pass gives the stock fallback's chunks bit for bit at SM_CHECK's shapes: q a transposed view as
+    mlx_lm hands it, K/V strided slices of a longer cache buffer, odd key counts and a folded last chunk."""
+    ks = mx.random.split(mx.random.key(hq * 1000 + d + 7), 3)
+    scale = d ** -0.5
+    for t, n, w in SM_CHECK:
+        q = mx.random.normal((1, t, hq, d), dtype, key=ks[0]).transpose(0, 2, 1, 3)
+        kb = mx.random.normal((1, hkv, n + 256, d), dtype, key=ks[1])
+        vb = mx.random.normal((1, hkv, n + 256, d), dtype, key=ks[2])
+        mx.eval(q, kb, vb)
+        k, v = kb[:, :, :n], vb[:, :, :n]
+        w = max(w, min_rows)
+        ref = chunked(q, k, v, scale, w, min_rows, *floor)
+        if not mx.array_equal(chunked(q, k, v, scale, w, min_rows, *floor, fused=True), ref).item():
+            return False
+    return True
+
+
+def _sm_calibrate(hq, hkv, d, dtype, per_key, min_rows, floor):
+    """([(keys, width)], whether every SM_ROWS width ran) for one shape: at each SM_N key count, a pass's last SM_T rows
+    through the fused chunks at each width under the engine's own (the rows _attend cuts with the budget's room now) and
+    at its own, the fastest kept and 0 where its own won."""
+    ks = mx.random.split(mx.random.key(hq * 1000 + d), 3)
+    nmax = max(SM_N)
+    kb = mx.random.normal((1, hkv, nmax, d), dtype, key=ks[0])
+    vb = mx.random.normal((1, hkv, nmax, d), dtype, key=ks[1])
+    q = mx.random.normal((1, hq, SM_T, d), dtype, key=ks[2])
+    for a in (kb, vb, q):          # one at a time, so the generator's transients never coexist
+        mx.eval(a)
+    scale = d ** -0.5
+    out, full = [], True
+    for n in SM_N:
+        cap = stream_fast.prefill_cap_bytes(n, dtype.size)
+        own = SM_T if cap is None else min(SM_T, max(min_rows, int(cap // (n * per_key))))
+        cands = [w for w in SM_ROWS if min_rows <= w < own] + [own]
+        full = full and own > max(SM_ROWS)
+        k, v = kb[:, :, :n], vb[:, :, :n]
+        ms = _gqa_time([lambda w=w: chunked(q, k, v, scale, w, min_rows, *floor, fused=True) for w in cands])
+        best = cands[ms.index(min(ms))]
+        out.append((n, 0 if best == own else best))
+    return out, full
+
+
+def _sm_install(table, dtype):
+    """MOE_PREFILL_SOFTMAX's widths for the shapes chunkattn routes, reused from disk or checked, timed and kept, and the
+    note saying what was chosen."""
+    global sm
+    sm = {}
+    _sm_ok.clear()
+    if stream_fast.BACKEND != "metal":
+        return None
+    if not SM_ON:
+        return "stock (MOE_PREFILL_SOFTMAX=0)"
+    hsum = _softmax_hdr()
+    if hsum != SM_HDR or mx.__version__ not in SM_MLX:
+        return f"stock (softmax.h {hsum}, MLX {mx.__version__}: not the ones replayed)"
+    if dtype not in (mx.bfloat16, mx.float16) or not table:
+        return f"stock (no {dtype} shape chunkattn routes)"
+    t0 = time.perf_counter()
+    src = hashlib.sha1(_SM_SRC.encode()).hexdigest()[:12]
+    said = []
+    for (hq, hkv, d), (per_key, min_rows, *floor) in sorted(table.items()):
+        key = json.dumps([mx.device_info()["device_name"], mx.__version__, src, hq, hkv, d, str(dtype), per_key,
+                          min_rows, floor, SM_ROWS, SM_T, SM_N, SM_CHECK, GQA_REPS])
+        path = LAYOUT_DIR / f"smwidth-{hashlib.sha1(key.encode()).hexdigest()[:16]}.json"
+        try:
+            rows = [tuple(r) for r in json.loads(path.read_text())["rows"]]
+        except (OSError, ValueError, KeyError):
+            rows, full = [], True
+            if _sm_exact(hq, hkv, d, dtype, min_rows, floor):
+                rows, full = _sm_calibrate(hq, hkv, d, dtype, per_key, min_rows, floor)
+            mx.clear_cache()
+            try:
+                # A grid the budget cut short is used by this process but not kept.
+                if full:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps({"rows": rows, "key": key}))
+                    tmp.replace(path)
+            except OSError as e:
+                print(f"  prefill softmax: could not save its calibration to {path}: {e}", flush=True)
+        if rows:
+            sm[(hq, hkv, d, str(dtype))] = rows
+        said.append(f"{hq}/{hkv}x{d} " + (" ".join(f"{n >> 10}k:{w or 'own'}" for n, w in rows)
+                                         or "stock (the fused pass differs from the stock fallback)"))
+    return f"fused mask + softmax, rows {', '.join(said)} ({time.perf_counter() - t0:.1f} s)"
+
+
 def _heads(m):
     """mlx_lm spells an attention module's head counts differently across
     model files: qwen3.py aliases them to n_heads/n_kv_heads, while
@@ -903,6 +1166,9 @@ def install(model, table=None, verbose=False):
     said = _gqa_install(shapes, dtype)
     if said:
         note(f"  decode attention: {said}")
+    said = _sm_install(table, dtype)
+    if said:
+        note(f"  prefill softmax: {said}")
     note("  prefill attention: chunkattn "
           + (", ".join(f"{hq}/{hkv}x{d} >= {v[1]} rows" + (", causal keys" if v[2:3] and v[2] else "")
                         for (hq, hkv, d), v in sorted(table.items()))

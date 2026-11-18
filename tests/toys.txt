@@ -36,6 +36,7 @@ tests/test_front_ssd.py
 tests/test_fronts.py
 tests/test_gdn_cuda.py
 tests/test_governor.py
+tests/test_ctx_tuning.py
 tests/test_layer_glue.py
 tests/test_membudget_host.py
 tests/test_modelhost_mem_pct.py
@@ -44,7 +45,9 @@ tests/test_prefill_logits.py
 tests/test_qsa_attn.py
 tests/test_qsa_pool.py
 tests/test_sdpa_gqa.py
+tests/test_prefill_softmax.py
 tests/test_readpath.py
+tests/test_prefill_last_kv.py
 tests/test_route_cuda.py
 tests/test_route_kernel.py
 tests/test_shadow.py
