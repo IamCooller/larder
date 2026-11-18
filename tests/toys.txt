@@ -48,6 +48,7 @@ tests/test_sdpa_gqa.py
 tests/test_prefill_softmax.py
 tests/test_readpath.py
 tests/test_prefill_last_kv.py
+tests/test_wired_hold.py
 tests/test_route_cuda.py
 tests/test_route_kernel.py
 tests/test_shadow.py

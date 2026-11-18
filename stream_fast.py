@@ -979,6 +979,8 @@ class ArenaGovernor:
                 # No pass is coming to apply it: give the bytes back now.
                 self.store.fit(rebuild=False)
                 self.store.resized = False
+        if press and press >= 2:
+            wired_drop()
 
     def grow_now(self):
         """_GROW, a store's first decode pass after a prefill: the speed lane's growth (roof, first-step damping, margin over the reserve, budget, jitter filter) taken now, since the prefill left the pool empty and a bigger one costs no re-warming; True when the peak moved."""
@@ -1120,6 +1122,32 @@ class TierGovernor:
 
 
 _GOV = None
+
+# MOE_WIRED_HOLD (on by default, =0 turns it off): MLX's wired limit opens at load and stays open across turns, since mlx_lm's window a reply let macOS un-wire and compress up to 7 GB of our buffers after every reply, while held nothing was compressed and the replies were identical (turn_mem, wired_hold).
+_WIRED_HOLD = os.environ.get("MOE_WIRED_HOLD", "1") != "0"
+_WIRED = None       # the wired limit held now in bytes, None while none is
+
+
+def wired_arm():
+    """MOE_WIRED_HOLD, at load and at each request's start: hold the wired limit mlx_lm's window a reply would open, on Metal under the arena governor, unless macOS reports pressure 2 or more."""
+    global _WIRED
+    if _WIRED or not (_WIRED_HOLD and BACKEND == "metal" and _GOV is not None and _GOV.store is None):
+        return
+    press = _sysctl_int("kern.memorystatus_vm_pressure_level")
+    if press and press >= 2:
+        return
+    mx.synchronize()
+    _WIRED = mx.device_info()["max_recommended_working_set_size"]
+    mx.set_wired_limit(_WIRED)
+
+
+def wired_drop():
+    """The held wired limit back to 0, so macOS may take our buffers when another app needs them."""
+    global _WIRED
+    if _WIRED:
+        mx.synchronize()
+        mx.set_wired_limit(0)
+        _WIRED = None
 
 
 def make_governor(glus, n_exp, top_k, mem_pct, reserve_pct, host_gb,

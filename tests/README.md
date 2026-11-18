@@ -136,6 +136,7 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_layer_prefill.py` | Layer-major prefill under a budget store equals the plain path. | toy | - | 10 s | `python3 tests/test_layer_prefill.py` |
 | `test_readpath.py` | Prefill read path: a layer read ahead or only its gathered rows give the same set. | toy | - | under 10 s | `python3 tests/test_readpath.py` |
 | `test_prefill_last_kv.py` | MOE_PREFILL_LAST_KV: a cache-only prefill's last layer writes only its cache, bit-equal, and a pass whose outputs are read keeps the whole layer. | toy | - | under 10 s | `python3 tests/test_prefill_last_kv.py` |
+| `test_wired_hold.py` | MOE_WIRED_HOLD (on by default): the wired limit held from load, dropped by the idle tick at pressure 2 and re-armed at the next request; with =0, mlx_lm's window a reply as before. | toy | - | under 10 s | `python3 tests/test_wired_hold.py` |
 | `test_union_lm.py` | Layer-major read path (_LMReader): whole layer or union only, same buffers. | toy | - | 35 s | `python3 tests/test_union_lm.py` |
 | `test_lm_copy_whole.py` | MOE_LM_COPY_WHOLE: a layer-major layer read whole equals the default read. | toy | - | 22 s | `python3 tests/test_lm_copy_whole.py` |
 | `test_lm_rule.py` | The whole-layer rule is unchanged when the reader is not queued and corrected when it is. | toy | - | 10 s | `python3 tests/test_lm_rule.py` |
