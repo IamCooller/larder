@@ -70,6 +70,23 @@ class ForcedPolicy:
         self.turn = 0
         self.best = None
         self.history = []                # (turn, best, {arm: mean ms}) per change
+        self.ctx = None                  # the turn's context length, set by the caller before pick()
+        self.cx = {a: [] for a in self.arms}    # arm -> context length of those turns
+
+    def _fit(self, a):
+        """An arm's ms/token at self.ctx and its variance, from a line through its turns' context lengths when they differ."""
+        y, x = self.ms[a], self.cx[a]
+        if self.ctx is None or None in x or len(y) < 3 or len(set(x)) < 2:
+            return statistics.fmean(y), statistics.variance(y)
+        # A growing context slows every turn, so the spread is taken around the line and an arm not run lately is read at today's length.
+        slope, icpt = statistics.linear_regression(x, y)
+        res = sum((v - icpt - slope * c) ** 2 for c, v in zip(x, y))
+        return icpt + slope * self.ctx, res / (len(y) - 2)
+
+    def _stats(self):
+        fits = {a: self._fit(a) for a in self.arms}
+        means = {a: m for a, (m, _) in fits.items()}
+        return means, statistics.fmean([v for _, v in fits.values()]) ** 0.5
 
     def pick(self):
         """The arm to take this turn."""
@@ -77,9 +94,7 @@ class ForcedPolicy:
         lo = min(counts.values())
         if lo < 2:
             return next(a for a in self.arms if counts[a] == lo)
-        means = {a: statistics.fmean(self.ms[a]) for a in self.arms}
-        spread = statistics.fmean(
-            [statistics.variance(self.ms[a]) for a in self.arms]) ** 0.5
+        means, spread = self._stats()
         best = min(means, key=means.get)
         # Each slower arm's own re-probe schedule: z*z turns of its own gap to
         # the best, z in units of the arms' pooled spread (see class doc).
@@ -111,18 +126,17 @@ class ForcedPolicy:
         self.turn += 1
         self.last[arm] = self.turn
         self.ms[arm] = (self.ms[arm] + [ms])[-self.KEEP:]
+        self.cx[arm] = (self.cx[arm] + [self.ctx])[-self.KEEP:]
 
     def outclassed(self, arm):
         """Whether `arm` trails the best by sqrt(EVERY_MAX) pooled spreads or more, where
         pick() re-probes it only at its longest interval."""
         if any(len(self.ms[a]) < 2 for a in self.arms):
             return False
-        means = {a: statistics.fmean(self.ms[a]) for a in self.arms}
+        means, spread = self._stats()
         gap = means[arm] - min(means.values())
         if gap <= 0:
             return False
-        spread = statistics.fmean(
-            [statistics.variance(self.ms[a]) for a in self.arms]) ** 0.5
         return not spread or gap / spread >= self.EVERY_MAX ** 0.5
 
 
@@ -644,7 +658,11 @@ class StreamingLLM:
                     a0 = mx.get_active_memory()
                 # Only the cache is evaluated: the logits of every position are
                 # L x vocab, 2.7 GB for a 5.5k-token front, and nothing reads them.
-                self.model(mx.array(ids[j:j + n])[None], cache=self._cache)
+                stream_fast.CACHE_ONLY = stream_fast.LAST_KV
+                try:
+                    self.model(mx.array(ids[j:j + n])[None], cache=self._cache)
+                finally:
+                    stream_fast.CACHE_ONLY = False
                 mx.eval([stream_fast.cache_state(c) for c in self._cache])
                 if measure:
                     stream_fast.note_prefill(n, mx.get_peak_memory() - a0)
@@ -1318,6 +1336,9 @@ class StreamingLLM:
         if has_stub and self.stub_mode == "none":
             suffix, has_stub = suffix[:-L], False
         self._seen = kept + suffix
+        if stream_fast._GOV is not None:
+            # The arena governor compares speeds only within one context bucket.
+            stream_fast._GOV.ctx = len(self._seen)
         stub_at = len(self._seen) - L if has_stub else None
         if prefill_only:
             # Chunked as generate_step would have, because a newcomer's first token
@@ -1376,6 +1397,7 @@ class StreamingLLM:
         if sp is None and draft is None and forcer is not None:
             if self.forced_policy is None:
                 self.forced_policy = ForcedPolicy()
+            self.forced_policy.ctx = len(self._seen)
             forced_only = self.forced_policy.pick()
             if forced_only:
                 sp = spec.ForcedSpeculator(self.model)
@@ -1397,6 +1419,7 @@ class StreamingLLM:
                     pol = LeadPolicy if lead == "mtp" and spec.Speculator.ahead else ForcedPolicy
                     self.decode_policy_free = pol((lead, "plain"))
                 decode_policy = self.decode_policy_free
+            decode_policy.ctx = len(self._seen)
             decode_arm = decode_policy.pick()
             if decode_arm == "plain":
                 sp = forcer = draft = None

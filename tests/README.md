@@ -68,7 +68,7 @@ It sends every item greedy to both endpoints, scores it (GSM8K by the number aft
 | Memory-aware routing and the 3-bit pack do not lower quality | `quality_gate.py`, baseline against candidate |
 | Sampling matches plain sampling's distribution | `test_sampling.py` (chi-square against the exact joint distribution) |
 | The chat page, the API and editor clients change no reply | `golden_check.py` through each client's endpoint, `test_webchat.py`, `test_anthropic_api.py` |
-| Long-context kernels leave the cache bit-identical | `test_qsa_attn.py`, `test_qsa_pool.py`, `test_foldattn.py`, `test_chunkattn.py`, `test_sdpa_gqa.py` |
+| Long-context kernels leave the cache bit-identical | `test_qsa_attn.py`, `test_qsa_pool.py`, `test_foldattn.py`, `test_chunkattn.py`, `test_sdpa_gqa.py`, `test_prefill_softmax.py` |
 | Memory stays under the budget | `test_store*.py`, `test_governor.py`, `test_server_memory.py` |
 
 ## Tools
@@ -95,6 +95,7 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_chunkattn.py` | Query-chunked prefill attention for head dim 256 against the full computation, numerics and peak memory. | toy | - | under 10 s | `python3 tests/test_chunkattn.py` |
 | `test_qsa_attn.py` | QSA picks-only decode attention equals MLX's masked SDPA over the picks, bit for bit. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_qsa_attn.py` |
 | `test_sdpa_gqa.py` | Grouped-head decode attention (`MOE_SDPA_GQA`) equals MLX's two-pass vector SDPA bit for bit; calls outside it reach stock; its identity guard and install timing. | toy, Metal, MLX 0.32.2 | - | under 10 s | `python3 tests/test_sdpa_gqa.py` |
+| `test_prefill_softmax.py` | Fused prefill mask + softmax (`MOE_PREFILL_SOFTMAX`) equals MLX's unfused SDPA fallback bit for bit at the install's widths; calls outside it reach the stock path; its first-call check, identity guard and install timing. | toy, Metal, MLX 0.32.2 | - | under 15 s | `python3 tests/test_prefill_softmax.py` |
 | `test_qsa_pool.py` | The QSA indexer's kept pooled keys equal stock's re-pooled keys. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_qsa_pool.py` |
 | `test_layer_glue.py` | layer_glue kernels equal the stock lines they replace, bit for bit, at Flash-Next shapes. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_layer_glue.py` |
 | `test_prefill_glue.py` | The prefill-row glue kernels equal the stock lines over 1-2048 rows, each with a mutant that must be caught. | toy, needs mlx-lm with qwen4_exp | - | under 10 s | `python3 tests/test_prefill_glue.py` |
@@ -134,6 +135,8 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_prefill_mem.py` | Prefill memory levers are exact on toys. | toy, needs a tokenizer | - | 24 s | `MOE_TOY_TOKENIZER=CKPT python3 tests/test_prefill_mem.py` |
 | `test_layer_prefill.py` | Layer-major prefill under a budget store equals the plain path. | toy | - | 10 s | `python3 tests/test_layer_prefill.py` |
 | `test_readpath.py` | Prefill read path: a layer read ahead or only its gathered rows give the same set. | toy | - | under 10 s | `python3 tests/test_readpath.py` |
+| `test_prefill_last_kv.py` | MOE_PREFILL_LAST_KV: a cache-only prefill's last layer writes only its cache, bit-equal, and a pass whose outputs are read keeps the whole layer. | toy | - | under 10 s | `python3 tests/test_prefill_last_kv.py` |
+| `test_wired_hold.py` | MOE_WIRED_HOLD (on by default): the wired limit held from load, dropped by the idle tick at pressure 2 and re-armed at the next request; with =0, mlx_lm's window a reply as before. | toy | - | under 10 s | `python3 tests/test_wired_hold.py` |
 | `test_union_lm.py` | Layer-major read path (_LMReader): whole layer or union only, same buffers. | toy | - | 35 s | `python3 tests/test_union_lm.py` |
 | `test_lm_copy_whole.py` | MOE_LM_COPY_WHOLE: a layer-major layer read whole equals the default read. | toy | - | 22 s | `python3 tests/test_lm_copy_whole.py` |
 | `test_lm_rule.py` | The whole-layer rule is unchanged when the reader is not queued and corrected when it is. | toy | - | 10 s | `python3 tests/test_lm_rule.py` |
@@ -156,6 +159,7 @@ Times are from one run on a 16 GB M-series Mac without a tokenizer or CUDA; a sk
 | `test_store_resize.py` | The elastic store resized mid-generation keeps greedy tokens. | toy | - | 13 s | `python3 tests/test_store_resize.py` |
 | `test_claim_slots.py` | One slot per expert: no two experts share a slot at any width. | toy | - | under 10 s | `python3 tests/test_claim_slots.py` |
 | `test_governor.py` | The governor's size decisions (the floor-below-top_k bug), no weights. | toy | - | 12 s | `python3 tests/test_governor.py` |
+| `test_ctx_tuning.py` | The governor and the MTP/plain chooser under a growing context, no weights. | toy | - | under 10 s | `python3 tests/test_ctx_tuning.py` |
 | `test_membudget_host.py` | MemBudget's saved host term never lowers on a shorter process. | toy | - | 10 s | `python3 tests/test_membudget_host.py` |
 | `test_modelhost_mem_pct.py` | ModelHost forwards mem_pct and host_gb to the engine. | toy | - | under 10 s | `python3 tests/test_modelhost_mem_pct.py` |
 | `test_server_memory.py` | server.py --memory plumbing, routes and completion fields. | toy, needs a tokenizer | - | under 10 s | `MOE_TOY_TOKENIZER=CKPT python3 tests/test_server_memory.py` |

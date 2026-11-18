@@ -279,6 +279,7 @@ class ModelHost:
                                             self.reserve_pct)
         if getattr(new_llm, "_budget", None) is not None:
             new_llm._budget.prepare()       # MOE_RESIDENT: the store and the tier filled at load
+        stream_fast.wired_arm()
         old = self.llm
         self.llm = new_llm
         self.think_default = bool(getattr(new_llm, "thinking", False))
@@ -598,6 +599,7 @@ class ModelHost:
         with self._lock:
             self._asks -= 1
         self._queue_s = round(time.perf_counter() - t_ask, 3)
+        stream_fast.wired_arm()
 
     def _after(self, messages, text, tools):
         """A turn is over; when its reply went back to the user, queue the shadow of the next request behind whatever is queued."""

@@ -170,6 +170,7 @@ def check_dispatch():
         print("dispatch: empty table -- bit-identical, 0 chunk calls")
 
         chunkattn.install(model, table=table)
+        calls.clear()       # the install's own checks (MOE_PREFILL_SOFTMAX) call chunked too, the passes are counted
         assert mx.array_equal(logits(prompt), stock_out) and not calls
         print("dispatch: routed shape, no budget configured -- bit-identical, "
               "0 chunk calls")
