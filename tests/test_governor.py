@@ -668,6 +668,22 @@ def main():
     finally:
         sf._GOV = None
 
+    # 21. F4: an arena's idle reading, 7 GB high once macOS un-wired the idle server, is no
+    #     reference for the next prefill, so the swing is that prefill's own 0.5 GB, not 7.5.
+    g = _gov(cap=40, level=40, curve=lambda c: 25.0)
+    g._state["vm"] = (0.0, 1000)
+    _run(g, 1)
+    g._state["level"] = 81                  # idle: +7.04 GB over the decode's margin
+    g.idle_tick()
+    g._state.update(level=40, vm=(0.75, 1000))    # the prefill: 0.5 GB under it
+    for _ in range(len(g.glus)):
+        g.tick(do_sort=True)
+    g._state["vm"] = (0.0, 1000)
+    for _ in range(g.guard_period * len(g.glus)):
+        g.tick()
+    assert len(g._swings) == 1 and abs(g._swings[0] - 0.5) < 1e-6, list(g._swings)
+    assert abs(g._reserve_gb() - 0.5) < 1e-6, g._reserve_gb()
+
     sf._sysctl_int, sf.time, sf._vm_counts = real_sysctl, real_time, real_vm
     print("governor: floor, critical shrink, grows to the memory ceiling, "
           "survives one bad window, caps on a real collapse, does not "
@@ -681,7 +697,8 @@ def main():
           "raising the start goes through resize() so a stale iov never "
           "outlives it, idle ticks only shrink, the compressor counts "
           "against the room (start included), swapouts take a step off and "
-          "set a roof, the reserve is the prefill's measured dip -- all hold")
+          "set a roof, the reserve is the prefill's measured dip, an idle "
+          "reading is no reference for that dip -- all hold")
 
 
 if __name__ == "__main__":

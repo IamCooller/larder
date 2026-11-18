@@ -680,7 +680,7 @@ class ArenaGovernor:
         self.guard_period = guard_period
         # Swap safety: kern.memorystatus_level alone overstated the room by several GB because it counts non-compressed memory only and macOS swaps once that falls under two thirds of what the compressor occupies, which _margin() takes off, while how far this process itself drags the machine toward the line is measured from its own quiet windows against the lowest reading inside each prefill and that is the reserve.
         self._swap0 = None      # swapouts (pages) at the previous guard/idle tick
-        self._m_quiet = None    # margin at the last quiet tick (decode or idle)
+        self._m_quiet = None    # margin at the last quiet tick (decode, and idle only for a store without _HOLD)
         self._m_low = None      # lowest margin seen in the prefill since then
         self._swings = deque(maxlen=8)  # own falls of the margin, last 8 prefills
         self._why = {}          # the last guard tick's ceiling, for the history
@@ -953,12 +953,12 @@ class ArenaGovernor:
         self._prev, self.cap, self._skip = self.cap, want, True
 
     def idle_tick(self):
-        """Idle tick, on the model's thread while it is not decoding: the guard lane's shrink rules and swap reflex without growth, and a reading that is a quiet window for the reserve."""
+        """Idle tick, on the model's thread while it is not decoding: the guard lane's shrink rules and swap reflex without growth, its reading a quiet window for the reserve only on a store without _HOLD."""
         level, press, comp, swapped = self._read()
         if level is None or not self.glus:
             return
-        if not (_HOLD and self.store is not None):
-            # _HOLD: not a store's, since macOS lets go of an idle process's GPU wiring 1-2 s after a reply and the next prefill wiring it back read as a 4.6-7.2 GB dip (store_hold).
+        if self.store is not None and not _HOLD:
+            # Only a store without _HOLD reads idle as quiet, since macOS lets go of an idle process's GPU wiring after a reply and the next prefill wiring it back read as a 4.6-7.2 GB dip (store_hold) and grew the arena's reserve to 4.47 GB after 60 s pauses (wired_hold, reserve_dip).
             self._quiet(level, comp)
         avail_gb = self._avail(level, comp)
         if press and press >= 4:
