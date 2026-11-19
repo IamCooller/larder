@@ -668,6 +668,64 @@ def main():
     finally:
         sf._GOV = None
 
+    # 21. F4: an arena's idle reading, 7 GB high once macOS un-wired the idle server, is no
+    #     reference for the next prefill, so the swing is that prefill's own 0.5 GB, not 7.5.
+    g = _gov(cap=40, level=40, curve=lambda c: 25.0)
+    g._state["vm"] = (0.0, 1000)
+    _run(g, 1)
+    g._state["level"] = 81                  # idle: +7.04 GB over the decode's margin
+    g.idle_tick()
+    g._state.update(level=40, vm=(0.75, 1000))    # the prefill: 0.5 GB under it
+    for _ in range(len(g.glus)):
+        g.tick(do_sort=True)
+    g._state["vm"] = (0.0, 1000)
+    for _ in range(g.guard_period * len(g.glus)):
+        g.tick()
+    assert len(g._swings) == 1 and abs(g._swings[0] - 0.5) < 1e-6, list(g._swings)
+    assert abs(g._reserve_gb() - 0.5) < 1e-6, g._reserve_gb()
+
+    # 22. F2 with the room there: the parked arena comes back whole and the decision is logged.
+    g = _gov(cap=60, level=80, cap_max=96)
+    g._swings.append(1.0)
+    g.unpark_fit(60 * g.slot_gb)
+    r = g.unparks[-1]
+    assert g.cap == 60 and not g.history and r["new_cap"] == 60, (g.cap, r)
+    assert abs(r["pred"] - (g.total_gb * 0.8 - 60 * g.slot_gb)) < 1e-3 and r["extra"] == 0.0, r
+
+    # 23. F2 on a short margin: shrunk to the largest arena whose predicted margin meets the reserve,
+    #     with a roof there; pressure 2 halves it as idle_tick does.
+    g = _gov(cap=60, level=20, cap_max=96)  # margin 3.44 GB with the arena parked
+    g._swings.append(1.0)
+    g.unpark_fit(60 * g.slot_gb)
+    fit = int((g.total_gb * 0.2 - 1.0) / g.slot_gb)
+    assert g.cap == fit == g._roof and all(x._cap == fit for x in g.glus), (g.cap, fit, g._roof)
+    assert g.unparks[-1]["new_cap"] == fit and g.history[-1]["unpark"] == g.unparks[-1]["pred"]
+    g = _gov(cap=60, level=80, press=2, cap_max=96)
+    g.unpark_fit(60 * g.slot_gb)
+    assert g.cap == 30, f"pressure 2 at unpark: {g.cap}"
+
+    # 24. F2 learns the decode-start fall beyond the arena from the first decode reading with every
+    #     arena built, and the next prediction takes it off.
+    g = _gov(cap=60, level=80, cap_max=96)
+    g._swings.append(1.0)
+    _run(g, 1)
+    g.unpark_fit(60 * g.slot_gb)
+    m0 = g.unparks[-1]["margin"]
+    g._state["level"] = 55                  # the decode: arena back and 0.5 GB more gone
+    g.glus[3]._slot_of = None               # one layer not built yet: no measurement
+    for _ in range(g.guard_period * len(g.glus)):
+        g.tick()
+    assert not g._extra, list(g._extra)
+    g.glus[3]._slot_of = object()
+    for _ in range(g.guard_period * len(g.glus)):
+        g.tick()
+    want = m0 - g.total_gb * 0.55 - 60 * g.slot_gb
+    assert len(g._extra) == 1 and abs(g._extra[0] - want) < 1e-3, (list(g._extra), want)
+    assert g.unparks[-1]["quiet"] == round(g.total_gb * 0.55, 3)
+    g._state["level"] = 80
+    g.unpark_fit(60 * g.slot_gb)
+    assert abs(g.unparks[-1]["pred"] - (m0 - 60 * g.slot_gb - g._extra[0])) < 1e-3, g.unparks[-1]
+
     sf._sysctl_int, sf.time, sf._vm_counts = real_sysctl, real_time, real_vm
     print("governor: floor, critical shrink, grows to the memory ceiling, "
           "survives one bad window, caps on a real collapse, does not "
@@ -681,7 +739,9 @@ def main():
           "raising the start goes through resize() so a stale iov never "
           "outlives it, idle ticks only shrink, the compressor counts "
           "against the room (start included), swapouts take a step off and "
-          "set a roof, the reserve is the prefill's measured dip -- all hold")
+          "set a roof, the reserve is the prefill's measured dip, an idle "
+          "reading is no reference for that dip, unpark sizes the arena to the "
+          "next decode's room and learns its fall -- all hold")
 
 
 if __name__ == "__main__":
