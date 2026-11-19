@@ -594,10 +594,16 @@ def park_arenas(model):
 
 
 def unpark_arenas(model):
-    for g in glus_of(model):
+    parked = [g for g in glus_of(model)
+              if g._akey not in _ARENAS and g._slot_np is not None and g._budget is None]
+    gov = _GOV
+    if parked and gov is not None and gov.store is None and gov.glus and BACKEND == "metal":
+        # F2: size what comes back to the next decode's room before re-reading it (unpark_fit).
+        gov.unpark_fit(sum(g._cap * sum(p._packed["stride"] for p in g._projs) for g in parked) / 1e9)
+    for g in parked:
         if PREFILL_STOP is not None and PREFILL_STOP():
             return      # a request waits: the rest come back at their first claim
-        if g._akey not in _ARENAS and g._slot_np is not None and g._budget is None:
+        if g._slot_np is not None:      # a resize just now leaves it to its first claim
             g._init_arena()
 
 
@@ -684,6 +690,9 @@ class ArenaGovernor:
         self._m_low = None      # lowest margin seen in the prefill since then
         self._swings = deque(maxlen=8)  # own falls of the margin, last 8 prefills
         self._why = {}          # the last guard tick's ceiling, for the history
+        self._extra = deque(maxlen=8)   # unpark_fit: decode-start falls beyond the arena, last 8
+        self._unpark = None     # unpark_fit's record, room and arena GB until a decode reading measures it
+        self.unparks = deque(maxlen=64)  # unpark_fit's decisions, for probes
 
     @property
     def cap_min(self):
@@ -754,6 +763,40 @@ class ArenaGovernor:
             self._swings.append(max(0.0, self._m_quiet - self._m_low))
             self._m_low = None
         self._m_quiet = m
+        if self._unpark is not None and all(g._slot_of is not None for g in self.glus):
+            # The first decode reading with every arena built measures the last unpark's fall beyond the arena it re-read.
+            rec, room, took = self._unpark
+            rec["quiet"], rec["extra_new"] = round(m, 3), round(max(0.0, room - m - took), 3)
+            self._extra.append(rec["extra_new"])
+            self._unpark = None
+
+    def unpark_fit(self, parked_gb):
+        """F2, before unpark_arenas re-reads `parked_gb` of arena: shrink the arena to what the next decode's margin can hold over the reserve, predicted as the margin now less the arena and the largest recent decode-start fall beyond it (unpark_fit)."""
+        t = time.perf_counter()
+        mx.clear_cache()        # _init_arena would free the prefill's cache next anyway, so the reading sees it gone
+        level, press, comp, _ = self._peek()
+        if level is None:
+            return
+        m = self._margin(level, comp)
+        # The parked bytes already read as free, so only layers still built are added back.
+        room = m + self.cap * self.slot_gb - parked_gb
+        extra, reserve = max(self._extra, default=0.0), self._reserve_gb()
+        pred = room - self.cap * self.slot_gb - extra
+        want = self.cap
+        if pred < reserve:
+            want = max(self.cap_min, min(self.cap, int((room - extra - reserve) / self.slot_gb)))
+        if press and press >= 2:
+            want = min(want, max(self.cap_min, self.cap // 2))       # idle_tick's halving
+        rec = {"t": round(t, 2), "margin": round(m, 3), "parked_gb": round(parked_gb, 3), "extra": round(extra, 3),
+               "pred": round(pred, 3), "reserve": round(reserve, 3), "level": level, "press": press,
+               "cap": self.cap, "new_cap": want, "cap_min": self.cap_min}
+        if want < self.cap:
+            self._why = {"unpark": rec["pred"]}
+            self._set_roof(want, room)
+            self._resize(want, level, press)
+        self._unpark = (rec, room, self.cap * self.slot_gb)
+        rec["s"] = round(time.perf_counter() - t, 4)
+        self.unparks.append(rec)
 
     def _held_gb(self):
         """Everything MLX holds outside the arena (D2): active_memory() minus the arena's own cap*slot_gb share once the arena actually exists (_init_arena is lazy, on a layer's first decode), since subtracting before that went negative and inflated budget_slots."""
